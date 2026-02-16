@@ -1,0 +1,53 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+*.egg-info/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+.npm/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+
+# Keep shareable env templates
+!.env.example
+!*.env.example
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Large local data / artifacts
+gesture/ml/datasets/
+gesture/ml/artifacts/
+gesture/ml/**/checkpoints/
+*.onnx
+*.tflite
+*.wav
+*.npy
+*.joblib
