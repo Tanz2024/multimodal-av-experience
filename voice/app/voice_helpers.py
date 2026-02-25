@@ -214,6 +214,8 @@ def match_intent_keywords(text: str) -> str | None:
 
     if {"mute", "silence"} & tokens:
         return "mute"
+    if ("emergency" in tokens or "panic" in tokens) and ({"off", "mute", "stop"} & tokens):
+        return "all_sound_off"
     if {"next"} & tokens:
         return "next"
     if {"previous", "prev"} & tokens:
@@ -221,11 +223,45 @@ def match_intent_keywords(text: str) -> str | None:
     if {"back"} & tokens:
         return "back"
 
-    if "volume" in tokens or "sound" in tokens:
-        if {"up", "raise", "higher", "increase", "louder"} & tokens:
-            return "volume_up"
-        if {"down", "lower", "decrease", "quieter", "softer"} & tokens:
-            return "volume_down"
+    # Handle generic showroom requests like "open experience" / "show experiences".
+    # These are ambiguous without a target, so route to help instead of unknown.
+    has_experience_word = bool({"experience", "experiences", "showroom"} & tokens)
+    has_open_or_show = bool({"open", "show", "start", "launch"} & tokens)
+    named_experience_tokens = {"welcome", "kitchen", "invisible", "cinema", "lounge", "iconic"}
+    spoken_numbers = {"1", "2", "3", "4", "5", "6", "7", "one", "two", "three", "four", "five", "six", "seven"}
+    if (
+        has_experience_word
+        and has_open_or_show
+        and not (tokens & named_experience_tokens)
+        and not (tokens & spoken_numbers)
+    ):
+        return "help"
+
+    target_words = {"volume", "sound", "music", "audio", "speaker", "speakers"}
+    control_verbs = {"turn", "make", "set", "put"}
+    up_words = {"up", "raise", "higher", "increase", "louder", "boost"}
+    down_words = {"down", "lower", "decrease", "quieter", "softer", "reduce"}
+    max_words = {"full", "max", "maximum", "highest", "loudest"}
+    min_words = {"minimum", "min", "lowest", "quietest"}
+
+    has_target = bool(tokens & target_words)
+    has_control_verb = bool(tokens & control_verbs)
+    has_pronoun_target = "it" in tokens
+
+    # Handle "full volume"/"max music"/"minimum sound" style requests.
+    if (tokens & max_words) and (has_target or has_control_verb):
+        return "volume_up"
+    if (tokens & min_words) and (has_target or has_control_verb):
+        return "volume_down"
+
+    # Handle natural forms like:
+    # - "increase music volume"
+    # - "turn it up"
+    # - "make it quieter"
+    if (tokens & up_words) and (has_target or has_control_verb or has_pronoun_target):
+        return "volume_up"
+    if (tokens & down_words) and (has_target or has_control_verb or has_pronoun_target):
+        return "volume_down"
 
     return None
 
@@ -387,7 +423,9 @@ class CommandExecutor:
         self._system_volume = SystemVolumeController(
             enabled=os.getenv("SYSTEM_VOLUME_ENABLED", "true").lower() == "true",
             step=float(os.getenv("SYSTEM_VOLUME_STEP", "0.06")),
+            max_scalar=float(os.getenv("MAX_VOLUME_CAP", "0.90")),
         )
+        self._max_volume_cap = max(0.0, min(1.0, float(os.getenv("MAX_VOLUME_CAP", "0.90"))))
 
     def execute(self, intent: str):
         session = self.app.state.session
@@ -480,9 +518,9 @@ class CommandExecutor:
         elif intent == "volume_up":
             sys_vol = self._system_volume.change(+1)
             if sys_vol is not None:
-                session["volume"] = sys_vol
+                session["volume"] = min(self._max_volume_cap, float(sys_vol))
             else:
-                session["volume"] = min(1.0, float(session.get("volume") or 0.0) + 0.1)
+                session["volume"] = min(self._max_volume_cap, float(session.get("volume") or 0.0) + 0.1)
             session["navigate"] = None
         elif intent == "volume_down":
             sys_vol = self._system_volume.change(-1)
@@ -593,9 +631,10 @@ class SystemVolumeController:
     Best-effort OS volume controller used by voice intents.
     """
 
-    def __init__(self, enabled: bool = True, step: float = 0.06):
+    def __init__(self, enabled: bool = True, step: float = 0.06, max_scalar: float = 1.0):
         self.enabled = bool(enabled)
         self.step = max(0.01, min(0.25, float(step)))
+        self.max_scalar = max(0.0, min(1.0, float(max_scalar)))
         self._backend = None
         self._volume = None
 
@@ -677,7 +716,7 @@ class SystemVolumeController:
         if self._backend == "pycaw" and self._volume is not None:
             try:
                 cur = float(self._volume.GetMasterVolumeLevelScalar())
-                tgt = max(0.0, min(1.0, cur + step))
+                tgt = max(0.0, min(self.max_scalar, cur + step))
                 self._volume.SetMute(0, None)
                 self._volume.SetMasterVolumeLevelScalar(tgt, None)
                 return tgt
@@ -695,7 +734,15 @@ class SystemVolumeController:
                     ["pactl", "set-sink-volume", "@DEFAULT_SINK@", signed],
                     check=False,
                 )
-                return self._scalar()
+                cur = self._scalar()
+                if cur is not None and cur > self.max_scalar:
+                    cap_pct = f"{int(round(self.max_scalar * 100))}%"
+                    subprocess.run(
+                        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", cap_pct],
+                        check=False,
+                    )
+                    return self._scalar()
+                return cur
             except Exception:
                 return None
         return None

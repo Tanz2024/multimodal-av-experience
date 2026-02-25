@@ -7,6 +7,7 @@ import queue
 import subprocess
 import tempfile
 import time
+import random
 from threading import Event, Lock, Thread
 from urllib.parse import urlencode
 
@@ -46,6 +47,36 @@ PORT = int(os.getenv("PORT", "8010"))
 
 SETTINGS = Settings()
 
+DEMO_GRAMMAR_LOCK = os.getenv("DEMO_GRAMMAR_LOCK", "true").lower() == "true"
+DEMO_ALLOWED_INTENTS = {
+    i.strip()
+    for i in os.getenv(
+        "DEMO_ALLOWED_INTENTS",
+        "greet,help,bye,back,cancel,next,previous,mute,all_sound_off,welcome,kitchen,invisible,cinema,lounge,iconic,open_1,open_2,open_3,open_4,open_5,open_6,open_7,option_1,option_2,option_3,option_4,option_5,option_6,option_7,volume_up,volume_down",
+    ).split(",")
+    if i.strip()
+}
+INTENT_CONFIRM_THRESHOLD = float(os.getenv("INTENT_CONFIRM_THRESHOLD", "0.82"))
+INTENT_CONFIRM_WINDOW_SEC = float(os.getenv("INTENT_CONFIRM_WINDOW_SEC", "5.0"))
+CONFIRM_FOR_INTENTS = {
+    i.strip()
+    for i in os.getenv(
+        "INTENT_CONFIRM_FOR",
+        "volume_up,volume_down,mute,all_sound_off,open_1,open_2,open_3,open_4,open_5,open_6,open_7,welcome,kitchen,invisible,cinema,lounge,iconic",
+    ).split(",")
+    if i.strip()
+}
+COMMAND_RATE_LIMIT_SEC = float(os.getenv("COMMAND_RATE_LIMIT_SEC", "0.35"))
+COMMAND_DEBOUNCE_SEC = float(os.getenv("COMMAND_DEBOUNCE_SEC", "1.0"))
+COMMAND_QUEUE_MAX = int(os.getenv("COMMAND_QUEUE_MAX", "100"))
+COMMAND_TIMEOUT_SEC = float(os.getenv("COMMAND_TIMEOUT_SEC", "0.8"))
+COMMAND_MAX_RETRIES = int(os.getenv("COMMAND_MAX_RETRIES", "2"))
+COMMAND_LOG_MAX = int(os.getenv("COMMAND_LOG_MAX", "200"))
+ACK_MODE = (os.getenv("COMMAND_ACK_MODE", "mock") or "mock").strip().lower()
+ACK_FAIL_RATE = max(0.0, min(1.0, float(os.getenv("COMMAND_ACK_FAIL_RATE", "0.05"))))
+ACK_MIN_MS = max(0, int(os.getenv("COMMAND_ACK_MIN_MS", "60")))
+ACK_MAX_MS = max(ACK_MIN_MS, int(os.getenv("COMMAND_ACK_MAX_MS", "180")))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -56,6 +87,7 @@ clients = set()
 event_queue = queue.Queue()
 tts_queue = queue.Queue()
 audio_queue = queue.Queue(maxsize=100)
+command_queue = queue.Queue(maxsize=COMMAND_QUEUE_MAX)
 stop_event = Event()
 tts_stop_event = Event()
 
@@ -105,6 +137,9 @@ app.state.session = {
     "last_deepgram_is_final": False,
     "last_final_raw": "",
     "transcript_log": [],
+    "pending_confirmation": None,
+    "command_log": [],
+    "last_action": None,
 }
 app.state.metrics = {
     "last_wake_ts": 0.0,
@@ -116,7 +151,26 @@ app.state.metrics = {
     "asr_errors": 0,
     "tts_errors": 0,
     "audio_queue_drops": 0,
+    "cmd_queued": 0,
+    "cmd_ack_ok": 0,
+    "cmd_ack_fail": 0,
+    "cmd_retry": 0,
+    "cmd_dropped": 0,
+    "cmd_rate_limited": 0,
+    "cmd_debounced": 0,
+    "cmd_confirmations": 0,
+    "cmd_confirm_accept": 0,
+    "cmd_confirm_reject": 0,
+    "cmd_blocked_by_grammar": 0,
+    "deepgram_failovers": 0,
+    "asr_fallback_to_vosk": 0,
+    "cmd_latency_ms_last": 0.0,
+    "commands_failed": 0,
 }
+app.state.last_command_ts = 0.0
+app.state.last_intent = ""
+app.state.last_intent_ts = 0.0
+app.state.pending_confirmation = None
 
 
 def _emit(payload):
@@ -160,6 +214,60 @@ def _enqueue_tts(text: str):
     if not SETTINGS.tts_enabled:
         return
     tts_queue.put(text)
+
+
+def _append_command_log(entry: dict):
+    log = app.state.session.get("command_log")
+    if not isinstance(log, list):
+        log = []
+    log.append(entry)
+    if len(log) > COMMAND_LOG_MAX:
+        log = log[-COMMAND_LOG_MAX:]
+    app.state.session["command_log"] = log
+
+
+def _log_command_event(event: str, **kwargs):
+    payload = {"ts": round(time.time(), 3), "event": event, **kwargs}
+    _append_command_log(_json_sanitize(payload))
+    app.state.session["last_action"] = payload
+    logger.info("command_event=%s data=%s", event, {k: v for k, v in kwargs.items()})
+
+
+def _confirm_yes(text: str) -> bool:
+    toks = set(normalize_tokens(text))
+    return bool(toks & {"yes", "yeah", "yep", "correct", "right", "confirm", "do", "ok", "okay"})
+
+
+def _confirm_no(text: str) -> bool:
+    toks = set(normalize_tokens(text))
+    return bool(toks & {"no", "nope", "wrong", "cancel", "stop", "dont", "don't"})
+
+
+def _emergency_all_off(text: str) -> bool:
+    toks = set(normalize_tokens(text))
+    panic = {"emergency", "panic", "urgent", "immediately", "immediate"}
+    off = {"off", "mute", "stop", "silence", "shutdown"}
+    return bool(toks & panic and toks & off)
+
+
+class CommandAdapter:
+    def send(self, intent: str, payload: dict, timeout_sec: float) -> bool:
+        raise NotImplementedError
+
+
+class MockCommandAdapter(CommandAdapter):
+    def send(self, intent: str, payload: dict, timeout_sec: float) -> bool:
+        del payload, timeout_sec
+        delay_ms = random.randint(ACK_MIN_MS, ACK_MAX_MS)
+        time.sleep(delay_ms / 1000.0)
+        return random.random() >= ACK_FAIL_RATE
+
+
+def _adapter() -> CommandAdapter:
+    # Placeholder for future hardware adapters; currently mock ACK simulation.
+    if ACK_MODE == "mock":
+        return MockCommandAdapter()
+    return MockCommandAdapter()
 
 
 def _stop_intent(text: str) -> bool:
@@ -229,6 +337,106 @@ def _load_intent_bundles():
 INTENT_BUNDLES = _load_intent_bundles()
 VOICE_PRESET = dict(INTENT_BUNDLES.get("deepgram", {}).get("voice_preset", VOICE_PRESET))
 executor = CommandExecutor(app)
+command_adapter = _adapter()
+
+
+def _enqueue_command_action(intent: str, text: str, confidence: float, source: str) -> bool:
+    now = time.time()
+    # Emergency commands bypass debounce/rate-limit.
+    emergency = intent in {"all_sound_off", "mute"}
+
+    if (not emergency) and (now - app.state.last_command_ts) < COMMAND_RATE_LIMIT_SEC:
+        app.state.metrics["cmd_rate_limited"] += 1
+        app.state.session["debug"] = "Command rate-limited"
+        _log_command_event("rate_limited", intent=intent, text=text)
+        _emit_state()
+        return False
+
+    if (not emergency) and intent == app.state.last_intent and (now - app.state.last_intent_ts) < COMMAND_DEBOUNCE_SEC:
+        app.state.metrics["cmd_debounced"] += 1
+        app.state.session["debug"] = "Command ignored (debounced)"
+        _log_command_event("debounced", intent=intent, text=text)
+        _emit_state()
+        return False
+
+    item = {
+        "intent": intent,
+        "text": text,
+        "confidence": float(confidence or 0.0),
+        "source": source,
+        "queued_at": now,
+        "attempt": 0,
+    }
+    try:
+        if emergency:
+            # Flush queued non-emergency commands and prioritize all-off behavior.
+            while not command_queue.empty():
+                try:
+                    command_queue.get_nowait()
+                    command_queue.task_done()
+                except Exception:
+                    break
+        command_queue.put_nowait(item)
+    except queue.Full:
+        app.state.metrics["cmd_dropped"] += 1
+        app.state.session["debug"] = "Command queue full"
+        _log_command_event("queue_full", intent=intent, text=text)
+        _emit_state()
+        return False
+
+    app.state.metrics["cmd_queued"] += 1
+    app.state.last_command_ts = now
+    app.state.last_intent = intent
+    app.state.last_intent_ts = now
+    _log_command_event("queued", intent=intent, confidence=round(float(confidence or 0.0), 3), source=source)
+    _emit_state()
+    return True
+
+
+def command_worker():
+    while not stop_event.is_set():
+        item = command_queue.get()
+        if item is None:
+            break
+        intent = str(item.get("intent") or "")
+        text = str(item.get("text") or "")
+        confidence = float(item.get("confidence") or 0.0)
+        queued_at = float(item.get("queued_at") or time.time())
+
+        success = False
+        for attempt in range(1, COMMAND_MAX_RETRIES + 2):
+            item["attempt"] = attempt
+            ack = command_adapter.send(intent, item, COMMAND_TIMEOUT_SEC)
+            if ack:
+                success = True
+                app.state.metrics["cmd_ack_ok"] += 1
+                break
+            app.state.metrics["cmd_ack_fail"] += 1
+            if attempt <= COMMAND_MAX_RETRIES:
+                app.state.metrics["cmd_retry"] += 1
+                time.sleep(min(0.2 * attempt, 0.8))
+
+        latency_ms = max(0.0, (time.time() - queued_at) * 1000.0)
+        app.state.metrics["cmd_latency_ms_last"] = round(latency_ms, 2)
+        if success:
+            executor.execute(intent)
+            _log_command_event(
+                "executed",
+                intent=intent,
+                confidence=round(confidence, 3),
+                latency_ms=round(latency_ms, 2),
+                text=text,
+            )
+        else:
+            app.state.metrics["commands_failed"] = int(app.state.metrics.get("commands_failed", 0)) + 1
+            _log_command_event(
+                "failed",
+                intent=intent,
+                confidence=round(confidence, 3),
+                latency_ms=round(latency_ms, 2),
+                text=text,
+            )
+        command_queue.task_done()
 
 
 def _intent_bundle_for_source(source: str | None):
@@ -248,6 +456,76 @@ def match_intent_exact(text: str, phrases: dict[str, list[str]]) -> str | None:
     return None
 
 
+COMMAND_GATE_BASE_TOKENS = {
+    "welcome",
+    "kitchen",
+    "invisible",
+    "cinema",
+    "lounge",
+    "iconic",
+    "open",
+    "option",
+    "next",
+    "previous",
+    "prev",
+    "back",
+    "cancel",
+    "mute",
+    "silence",
+    "volume",
+    "louder",
+    "quieter",
+    "raise",
+    "lower",
+    "increase",
+    "decrease",
+    "up",
+    "down",
+    "sound",
+    "off",
+    "help",
+    "hello",
+    "hi",
+    "hey",
+    "jarvis",
+}
+COMMAND_GATE_IGNORE_TOKENS = {
+    "the",
+    "a",
+    "an",
+    "to",
+    "of",
+    "for",
+    "and",
+    "or",
+    "with",
+    "this",
+    "that",
+    "please",
+}
+COMMAND_HINT_TOKENS = set(COMMAND_GATE_BASE_TOKENS)
+
+
+def _refresh_command_hint_tokens():
+    dynamic_tokens = set(COMMAND_GATE_BASE_TOKENS)
+    for bundle in INTENT_BUNDLES.values():
+        phrases = (bundle or {}).get("phrases", {})
+        if not isinstance(phrases, dict):
+            continue
+        for examples in phrases.values():
+            if not isinstance(examples, list):
+                continue
+            for ex in examples:
+                for tok in normalize_tokens(str(ex)):
+                    if len(tok) >= 3 and tok not in COMMAND_GATE_IGNORE_TOKENS:
+                        dynamic_tokens.add(tok)
+    COMMAND_HINT_TOKENS.clear()
+    COMMAND_HINT_TOKENS.update(dynamic_tokens)
+
+
+_refresh_command_hint_tokens()
+
+
 def _looks_like_command_text(text: str) -> bool:
     """
     Heuristic gate for ALWAYS_LISTEN mode so casual speech doesn't trigger
@@ -256,40 +534,7 @@ def _looks_like_command_text(text: str) -> bool:
     toks = set(normalize_tokens(text))
     if not toks:
         return False
-    command_tokens = {
-        "welcome",
-        "kitchen",
-        "invisible",
-        "cinema",
-        "lounge",
-        "iconic",
-        "open",
-        "option",
-        "next",
-        "previous",
-        "prev",
-        "back",
-        "cancel",
-        "mute",
-        "silence",
-        "volume",
-        "louder",
-        "quieter",
-        "raise",
-        "lower",
-        "increase",
-        "decrease",
-        "up",
-        "down",
-        "sound",
-        "off",
-        "help",
-        "hello",
-        "hi",
-        "hey",
-        "jarvis",
-    }
-    if toks & command_tokens:
+    if toks & COMMAND_HINT_TOKENS:
         return True
     digits = {"1", "2", "3", "4", "5", "6", "7", "one", "two", "three", "four", "five", "six", "seven"}
     return bool(toks & digits and ("open" in toks or "option" in toks))
@@ -963,6 +1208,7 @@ def voice_worker(loop):
             }
             _emit(payload)
             app.state.metrics["last_final_ts"] = now
+            _log_command_event("transcript_final", text=text, asr_source=cmd_asr_source)
 
             if _stop_intent(text):
                 tts_stop_event.set()
@@ -972,17 +1218,113 @@ def voice_worker(loop):
             intent_responses = bundle.get("responses", {}) if isinstance(bundle, dict) else {}
             intent_classifier = bundle.get("classifier", None) if isinstance(bundle, dict) else None
 
-            intent = match_intent_exact(text, intent_phrases)
+            pending = app.state.pending_confirmation
+            if pending and time.time() <= float(pending.get("expires_at") or 0.0):
+                if _confirm_yes(text):
+                    app.state.metrics["cmd_confirm_accept"] += 1
+                    intent = str(pending.get("intent") or "")
+                    intent_conf = float(pending.get("confidence") or 0.0)
+                    app.state.pending_confirmation = None
+                    app.state.session["pending_confirmation"] = None
+                    app.state.session["debug"] = ""
+                    _log_command_event("confirmation_yes", intent=intent)
+                    if intent:
+                        app.state.session["last_response"] = f"Confirmed {intent.replace('_', ' ')}."
+                        _enqueue_tts(app.state.session["last_response"])
+                elif _confirm_no(text):
+                    app.state.metrics["cmd_confirm_reject"] += 1
+                    app.state.pending_confirmation = None
+                    app.state.session["pending_confirmation"] = None
+                    app.state.session["last_intent"] = "cancel"
+                    app.state.session["last_response"] = "Okay, cancelled."
+                    app.state.session["debug"] = "Pending command cancelled"
+                    app.state.session["intent_seq"] += 1
+                    _log_command_event("confirmation_no")
+                    _emit_state()
+                    _enqueue_tts(app.state.session["last_response"])
+                    cooldown_until = now + SETTINGS.cooldown_sec
+                    app.state.cooldown_until = cooldown_until
+                    if always_listening:
+                        set_mode("LISTENING", now)
+                    else:
+                        set_mode("EXECUTING", now)
+                        executing_until = now + max(0.05, min(0.5, executing_hold_sec))
+                        reset_listening(to_idle=False)
+                    return
+                else:
+                    app.state.session["last_response"] = "Please say yes or no."
+                    app.state.session["debug"] = "Awaiting confirmation"
+                    _emit_state()
+                    _enqueue_tts(app.state.session["last_response"])
+                    return
+            else:
+                if pending:
+                    app.state.pending_confirmation = None
+                    app.state.session["pending_confirmation"] = None
+                intent = None
+                intent_conf = 0.0
+
+            if _emergency_all_off(text):
+                intent = "all_sound_off"
+                intent_conf = 1.0
+
+            if not intent:
+                intent = match_intent_exact(text, intent_phrases)
+                if intent:
+                    intent_conf = 1.0
             if not intent:
                 # Substring fallback: catches intent phrases embedded in longer ASR outputs.
                 intent = match_intent_contains(text, intent_phrases)
+                if intent:
+                    intent_conf = 0.93
             if not intent:
                 # Keyword fallback for robust command handling in noisy environments.
                 intent = match_intent_keywords(text)
+                if intent:
+                    intent_conf = 0.88
             if not intent and intent_classifier is not None:
-                intent, _ = classify_intent(text, intent_classifier, SETTINGS.intent_threshold)
+                intent, intent_conf = classify_intent(text, intent_classifier, SETTINGS.intent_threshold)
 
             if intent:
+                if DEMO_GRAMMAR_LOCK and intent not in DEMO_ALLOWED_INTENTS:
+                    app.state.metrics["cmd_blocked_by_grammar"] += 1
+                    app.state.session["debug"] = f"Blocked by demo grammar: {intent}"
+                    app.state.session["last_intent"] = "unknown"
+                    app.state.session["last_response"] = "That command is not allowed in this demo."
+                    app.state.session["intent_seq"] += 1
+                    _log_command_event("blocked_grammar", intent=intent, text=text)
+                    _emit_state()
+                    _enqueue_tts(app.state.session["last_response"])
+                    return
+
+                if (
+                    intent in CONFIRM_FOR_INTENTS
+                    and float(intent_conf or 0.0) < max(0.0, min(1.0, INTENT_CONFIRM_THRESHOLD))
+                ):
+                    app.state.metrics["cmd_confirmations"] += 1
+                    app.state.pending_confirmation = {
+                        "intent": intent,
+                        "text": text,
+                        "confidence": float(intent_conf or 0.0),
+                        "expires_at": time.time() + INTENT_CONFIRM_WINDOW_SEC,
+                    }
+                    app.state.session["pending_confirmation"] = dict(app.state.pending_confirmation)
+                    app.state.session["last_intent"] = "confirm"
+                    app.state.session["last_response"] = f"Did you mean {intent.replace('_', ' ')}?"
+                    app.state.session["debug"] = (
+                        f"Low confidence {float(intent_conf or 0.0):.2f}, awaiting confirmation"
+                    )
+                    app.state.session["intent_seq"] += 1
+                    _log_command_event(
+                        "confirmation_requested",
+                        intent=intent,
+                        confidence=round(float(intent_conf or 0.0), 3),
+                        text=text,
+                    )
+                    _emit_state()
+                    _enqueue_tts(app.state.session["last_response"])
+                    return
+
                 app.state.session["last_intent"] = intent
                 app.state.session["last_response"] = intent_responses.get(intent, "")
                 app.state.session["last_final"] = text
@@ -996,7 +1338,7 @@ def voice_worker(loop):
                         _enqueue_tts(app.state.session["last_response"])
                     return
 
-                executor.execute(intent)
+                _enqueue_command_action(intent, text=text, confidence=float(intent_conf or 0.0), source=cmd_asr_source)
                 if app.state.session["last_response"]:
                     _enqueue_tts(app.state.session["last_response"])
 
@@ -1061,6 +1403,7 @@ def voice_worker(loop):
                     events = vosk_stream.process_audio(data_norm)
                     asr_source = "vosk"
                     app.state.voice_ok = True
+                    app.state.metrics["asr_fallback_to_vosk"] += 1
                 else:
                     events = []
                     asr_source = "none"
@@ -1090,6 +1433,7 @@ def voice_worker(loop):
                     deepgram = None
                     dg_next_connect_ts = now + 1.5
                     app.state.voice_ok = False
+                    app.state.metrics["deepgram_failovers"] += 1
                 continue
 
             if event.get("type") != "Results":
@@ -1319,6 +1663,7 @@ async def health():
         "voice_ok": app.state.voice_ok,
         "mode": app.state.mode,
         "cooldown_until": app.state.cooldown_until,
+        "command_queue_depth": command_queue.qsize(),
         "metrics": dict(app.state.metrics),
     })
 
@@ -1330,9 +1675,75 @@ async def status():
         "voice_ok": app.state.voice_ok,
         "session": dict(app.state.session),
         "metrics": dict(app.state.metrics),
+        "command_queue_depth": command_queue.qsize(),
         "voice_preset": dict(VOICE_PRESET),
         "clients": len(clients),
     })
+
+
+@app.get("/metrics")
+async def metrics():
+    return _json_sanitize(
+        {
+            "ok": True,
+            "queue": {
+                "depth": command_queue.qsize(),
+                "max": COMMAND_QUEUE_MAX,
+            },
+            "metrics": dict(app.state.metrics),
+            "asr": {
+                "source": app.state.session.get("asr_source", "none"),
+                "voice_ok": app.state.voice_ok,
+                "deepgram_model": SETTINGS.deepgram_model,
+                "vosk_enabled": bool(SETTINGS.vosk_model_path),
+            },
+            "safety": {
+                "demo_grammar_lock": DEMO_GRAMMAR_LOCK,
+                "allowed_intents": sorted(DEMO_ALLOWED_INTENTS),
+                "confirm_threshold": INTENT_CONFIRM_THRESHOLD,
+                "rate_limit_sec": COMMAND_RATE_LIMIT_SEC,
+                "debounce_sec": COMMAND_DEBOUNCE_SEC,
+            },
+        }
+    )
+
+
+@app.get("/asr/validate_failover")
+async def validate_failover():
+    fallbacks = int(app.state.metrics.get("asr_fallback_to_vosk", 0))
+    failovers = int(app.state.metrics.get("deepgram_failovers", 0))
+    return _json_sanitize(
+        {
+            "ok": True,
+            "deepgram_failovers": failovers,
+            "vosk_fallback_frames": fallbacks,
+            "validation": {
+                "fallback_path_active": bool(fallbacks > 0 or failovers > 0),
+                "voice_ok": bool(app.state.voice_ok),
+                "current_asr_source": app.state.session.get("asr_source", "none"),
+            },
+        }
+    )
+
+
+@app.post("/asr/failover_test")
+async def asr_failover_test(simulate: bool = True):
+    """
+    Lightweight validation hook for monitoring pipeline behavior without hardware changes.
+    """
+    if simulate:
+        app.state.metrics["deepgram_failovers"] += 1
+        if SETTINGS.vosk_model_path:
+            app.state.metrics["asr_fallback_to_vosk"] += 1
+    return _json_sanitize(
+        {
+            "ok": True,
+            "simulated": bool(simulate),
+            "deepgram_failovers": int(app.state.metrics.get("deepgram_failovers", 0)),
+            "vosk_fallback_frames": int(app.state.metrics.get("asr_fallback_to_vosk", 0)),
+            "vosk_configured": bool(SETTINGS.vosk_model_path),
+        }
+    )
 
 
 @app.post("/ui_sync")
@@ -1381,6 +1792,7 @@ async def ui_sync(request: Request):
 async def reload_intents():
     global INTENT_BUNDLES, VOICE_PRESET
     INTENT_BUNDLES = _load_intent_bundles()
+    _refresh_command_hint_tokens()
     VOICE_PRESET = dict(INTENT_BUNDLES.get("deepgram", {}).get("voice_preset", VOICE_PRESET))
     logger.info(
         "Intent configs reloaded: deepgram=%s vosk=%s",
@@ -1504,6 +1916,11 @@ async def models_check():
             "transcript_debug_enabled": SETTINGS.transcript_debug_enabled,
             "transcript_debug_max": SETTINGS.transcript_debug_max,
             "use_embeddings":    os.getenv("USE_EMBEDDINGS", "false").lower() == "true",
+            "demo_grammar_lock": DEMO_GRAMMAR_LOCK,
+            "intent_confirm_threshold": INTENT_CONFIRM_THRESHOLD,
+            "command_rate_limit_sec": COMMAND_RATE_LIMIT_SEC,
+            "command_debounce_sec": COMMAND_DEBOUNCE_SEC,
+            "command_queue_max": COMMAND_QUEUE_MAX,
         },
         "runtime": {
             "noise_profile_ready": app.state.session.get("noise_profile_ready", False),
@@ -1678,6 +2095,7 @@ async def on_startup():
     app.state.broadcaster_task = asyncio.create_task(broadcaster())
     app.state.worker_task = asyncio.create_task(asyncio.to_thread(voice_worker, loop))
     app.state.tts_task = asyncio.create_task(asyncio.to_thread(tts_worker))
+    app.state.command_task = asyncio.create_task(asyncio.to_thread(command_worker))
 
 
 @app.on_event("shutdown")
@@ -1685,6 +2103,7 @@ async def on_shutdown():
     stop_event.set()
     event_queue.put(None)
     tts_queue.put(None)
+    command_queue.put(None)
 
     task = getattr(app.state, "broadcaster_task", None)
     if task:

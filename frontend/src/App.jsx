@@ -1,4 +1,13 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import {
+  CookingPot,
+  Diamond,
+  EyeSlash,
+  FilmSlate,
+  HandWaving,
+  SpeakerX,
+  UsersThree,
+} from '@phosphor-icons/react';
 import ListeningAnimation from './components/ListeningAnimation';
 import VoiceWave from './components/VoiceWave';
 import AudioSpectrum from './components/AudioSpectrum';
@@ -29,6 +38,7 @@ const VOICE_UI_SYNC_URL =
   import.meta.env.VITE_VOICE_UI_SYNC_URL || `${HTTP_ORIGIN}${VOICE_BASE_PATH}/ui_sync`;
 
 const BACKEND_TTS = String(import.meta.env.VITE_BACKEND_TTS || 'false').toLowerCase() === 'true';
+const BROWSER_TTS = String(import.meta.env.VITE_BROWSER_TTS || 'false').toLowerCase() === 'true';
 const FORCE_BROWSER_TTS =
   String(import.meta.env.VITE_FORCE_BROWSER_TTS || 'false').toLowerCase() === 'true';
 
@@ -40,7 +50,7 @@ const experiences = [
   {
     id: 'welcome',
     title: 'Welcome Experience',
-    icon: '✦',
+    icon: HandWaving,
     description: 'First impressions, perfectly calibrated',
     options: [
       { id: 'soft', label: 'Soft Welcome', faderLabel: 'Soft Welcome Volume' },
@@ -50,7 +60,7 @@ const experiences = [
   {
     id: 'kitchen',
     title: 'Kitchen Experience',
-    icon: '◈',
+    icon: CookingPot,
     description: 'Sound designed for culinary spaces',
     options: [
       { id: 'silent', label: 'Silent', faderLabel: 'Silent' },
@@ -61,7 +71,7 @@ const experiences = [
   {
     id: 'invisible',
     title: 'Invisible Experience',
-    icon: '◎',
+    icon: EyeSlash,
     description: 'Sound that disappears into architecture',
     options: [
       { id: 'silent2', label: 'Silent', faderLabel: 'Silent' },
@@ -72,7 +82,7 @@ const experiences = [
   {
     id: 'cinema',
     title: 'Cinema Experience',
-    icon: '▣',
+    icon: FilmSlate,
     description: 'Immersive theatrical soundscapes',
     options: [
       { id: 'invisible', label: 'Invisible Cinema', faderLabel: 'Invisible Cinema' },
@@ -83,7 +93,7 @@ const experiences = [
   {
     id: 'lounge',
     title: 'Lounge & Entertain',
-    icon: '◆',
+    icon: UsersThree,
     description: 'Social spaces, sonically perfected',
     options: [
       { id: 'lounge', label: 'Background Lounge', faderLabel: 'Background Lounge' },
@@ -94,7 +104,7 @@ const experiences = [
   {
     id: 'iconic',
     title: 'Iconic Design',
-    icon: '◇',
+    icon: Diamond,
     description: 'Statement pieces in sound',
     options: [
       { id: 'lounge2', label: 'Background Lounge', faderLabel: 'Background Lounge' },
@@ -105,7 +115,7 @@ const experiences = [
   {
     id: 'off',
     title: 'All Sound Off',
-    icon: '○',
+    icon: SpeakerX,
     description: 'Complete silence',
     options: [{ id: 'off', label: 'Confirm Mute', faderLabel: '' }],
   },
@@ -174,7 +184,7 @@ function shouldBargeIn(text) {
 }
 
 function fmtTime(ts) {
-  if (!ts) return '—';
+  if (!ts) return '--';
   return new Date(ts * 1000).toLocaleTimeString();
 }
 
@@ -295,7 +305,7 @@ export default function App() {
   const shouldUseBrowserTts = useMemo(() => {
     if (!window.speechSynthesis) return false;
     if (FORCE_BROWSER_TTS) return true;
-    if (!BACKEND_TTS) return true;
+    if (!BACKEND_TTS) return BROWSER_TTS;
 
     const backendTtsEnabled = modelsData?.settings?.tts_enabled;
     const piperExeOk = modelsData?.models?.piper_exe?.exists;
@@ -937,13 +947,13 @@ export default function App() {
      ───────────────────────────────────────────────────────────────────────── */
 
   return (
-    <div className="relative min-h-screen overflow-hidden font-display text-[#1e1f22]">
+    <div className="relative min-h-screen overflow-x-hidden font-display text-[#1e1f22]">
       {/* Background layers */}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(900px_520px_at_80%_12%,rgba(198,168,109,0.18),transparent_60%),radial-gradient(900px_520px_at_18%_78%,rgba(140,150,170,0.16),transparent_60%),linear-gradient(180deg,#f2efe9_0%,#f7f4ee_60%,#ffffff_100%)]" />
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(0,0,0,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(0,0,0,0.04)_1px,transparent_1px)] bg-[size:46px_46px] opacity-20" />
       <div className="pointer-events-none absolute -inset-32 bg-[radial-gradient(circle_at_50%_40%,transparent_30%,rgba(0,0,0,0.2)_75%)]" />
 
-      <div className="relative z-10 flex min-h-screen flex-col gap-6 px-5 py-6 md:px-10 lg:px-14">
+      <div className="relative z-10 mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-6 px-4 py-6 md:px-8 lg:px-12">
         {/* Listening animation overlay */}
         <ListeningAnimation isListening={voiceMode === 'LISTENING'} voiceLevel={voiceLevel} />
 
@@ -976,7 +986,7 @@ export default function App() {
         <header className="flex flex-wrap items-start justify-between gap-6">
           <div>
             <div className="text-[11px] uppercase tracking-[0.4em] text-[#7b8088]">CIAO CUCINE</div>
-            <div className="mt-2 text-3xl font-semibold tracking-[0.02em]">
+            <div className="mt-2 text-2xl font-semibold tracking-[0.02em] md:text-3xl">
               Audio Experience Suite
             </div>
             <div className="mt-1 text-sm text-[#5b6068]">
@@ -1000,9 +1010,9 @@ export default function App() {
         </header>
 
         {/* ── Main Grid ──────────────────────────────────────────────────── */}
-        <main className="grid flex-1 grid-cols-1 gap-6 lg:grid-cols-[minmax(320px,1.4fr)_minmax(280px,0.9fr)]">
+        <main className="grid flex-1 grid-cols-1 gap-6 lg:grid-cols-[minmax(320px,1.4fr)_minmax(280px,0.9fr)] xl:gap-8">
           {/* ── Left: Experience List ───────────────────────────────────── */}
-          <section className="rounded-[26px] border border-[#e3ddd2] bg-white/90 p-6 shadow-[0_24px_50px_rgba(20,18,14,0.12)] backdrop-blur">
+          <section className="rounded-[26px] border border-[#e3ddd2] bg-white/90 p-5 shadow-[0_24px_50px_rgba(20,18,14,0.12)] backdrop-blur sm:p-6">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-[11px] uppercase tracking-[0.28em] text-[#7b8088]">
@@ -1016,6 +1026,7 @@ export default function App() {
             <ul className="mt-6 space-y-3">
               {experiences.map((exp) => {
                 const isActive = activeModal === exp.id;
+                const ExperienceIcon = exp.icon;
                 return (
                   <li
                     key={exp.id}
@@ -1028,9 +1039,13 @@ export default function App() {
                   >
                     <div className="flex items-center gap-3">
                       <span
-                        className={`text-xl transition-colors ${isActive ? 'text-[#c6a86d]' : 'text-[#ccc] group-hover:text-[#c6a86d]/60'}`}
+                        className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition-colors ${
+                          isActive
+                            ? 'border-[#c6a86d]/50 bg-[#f7efde] text-[#c6a86d]'
+                            : 'border-[#e3ddd2] bg-white text-[#9b9fa6] group-hover:border-[#c6a86d]/40 group-hover:text-[#c6a86d]/70'
+                        }`}
                       >
-                        {exp.icon}
+                        <ExperienceIcon size={18} weight={isActive ? 'fill' : 'regular'} />
                       </span>
                       <div className="flex-1">
                         <div className="text-lg font-semibold text-[#1e1f22]">{exp.title}</div>
@@ -1047,7 +1062,7 @@ export default function App() {
           </section>
 
           {/* ── Right: Sidebar ─────────────────────────────────────────── */}
-          <aside className="flex flex-col gap-5">
+          <aside className="flex flex-col gap-4 md:gap-5">
             {/* Voice Console */}
             <Card title="VOICE CONSOLE" heading="Command Center" aside={`Say "${wakeHint}"`}>
               <div className="space-y-4">
@@ -1060,7 +1075,7 @@ export default function App() {
                   </span>
                 </Row>
                 <Row label="Heard">
-                  <span className="text-[#5b6068]">{voiceTranscript || '—'}</span>
+                  <span className="text-[#5b6068]">{voiceTranscript || '--'}</span>
                   <span className="ml-2 text-xs text-[#9b9fa6]">
                     {rmsPct !== null
                       ? `Mic ${rmsPct}%`
@@ -1132,7 +1147,7 @@ export default function App() {
                 {backendAudioSource === 'device'
                   ? 'Using Device Mic'
                   : micStreamStatus === 'streaming'
-                    ? '● Stop Browser Mic'
+                    ? 'Stop Browser Mic'
                     : 'Enable Browser Mic'}
               </button>
 
@@ -1156,7 +1171,7 @@ export default function App() {
                             {m.label}
                           </div>
                           <div className="truncate text-[10px] text-[#9b9fa6]" title={m.path}>
-                            {m.path || '—'}
+                            {m.path || '--'}
                           </div>
                           {!m.exists && m.reason && (
                             <div className="text-[10px] text-red-400">{m.reason}</div>
@@ -1196,7 +1211,7 @@ export default function App() {
                     <RuntimeItem
                       on={modelsData.runtime.noise_profile_ready}
                       amber={!modelsData.runtime.noise_profile_ready}
-                      label={`Profile ${modelsData.runtime.noise_profile_ready ? 'ready' : 'collecting…'}`}
+                      label={`Profile ${modelsData.runtime.noise_profile_ready ? 'ready' : 'collecting...'}`}
                     />
                     <div className="col-span-2 flex items-center gap-1.5">
                       <span className="text-[#9b9fa6]">Gate RMS:</span>
@@ -1228,19 +1243,19 @@ export default function App() {
                       : 'ASR fallback'
                   }
                 />
-                <Metric label="Clients" value={statusData?.clients ?? '—'} />
+                <Metric label="Clients" value={statusData?.clients ?? '--'} />
                 <Metric
                   label="ASR"
-                  value={modelsData?.models?.deepgram_api?.exists ? 'Deepgram ✓' : 'Missing'}
+                  value={modelsData?.models?.deepgram_api?.exists ? 'Deepgram OK' : 'Missing'}
                 />
-                <Metric label="Wakes" value={metrics.wakes ?? '—'} />
+                <Metric label="Wakes" value={metrics.wakes ?? '--'} />
                 <Metric
                   label="Intent"
                   value={modelsData?.settings?.asr_backend === 'deepgram' ? 'Deepgram' : 'Legacy'}
                 />
-                <Metric label="Commands" value={metrics.commands_executed ?? '—'} />
-                <Metric label="ASR Errors" value={metrics.asr_errors ?? '—'} />
-                <Metric label="TTS Errors" value={metrics.tts_errors ?? '—'} />
+                <Metric label="Commands" value={metrics.commands_executed ?? '--'} />
+                <Metric label="ASR Errors" value={metrics.asr_errors ?? '--'} />
+                <Metric label="TTS Errors" value={metrics.tts_errors ?? '--'} />
                 <Metric label="Last Wake" value={fmtTime(metrics.last_wake_ts)} />
                 <Metric label="Last Final" value={fmtTime(metrics.last_final_ts)} />
                 <Metric label="Last TTS" value={fmtTime(metrics.last_tts_ts)} />
@@ -1263,7 +1278,7 @@ export default function App() {
                   className="rounded-full border border-[#e3ddd2] px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-[#5b6068] transition-colors hover:border-[#c6a86d]/50"
                   onClick={closeModal}
                 >
-                  ← Back
+                  {'< Back'}
                 </button>
                 <div className="text-xs uppercase tracking-[0.3em] text-[#7b8088]">Experience</div>
               </div>

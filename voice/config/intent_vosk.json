@@ -7,41 +7,261 @@
     "noise_w": 0.7
   },
   "phrases": {
-    "greet": ["hello", "hi", "hey", "are you there", "can you hear me"],
-    "help": ["help", "what can you do", "what can i say", "commands", "show commands", "options", "list options"],
-    "bye": ["bye", "goodbye", "thanks", "thank you", "thanks for using jarvis", "see you"],
-    "back": ["back", "go back", "close", "close this", "close that", "exit", "dismiss", "close the panel", "go back please"],
-    "cancel": ["cancel", "never mind", "stop listening", "stop listening now", "cancel listening"],
-    "next": ["next", "next option", "next one", "move next"],
-    "previous": ["previous", "prev", "previous option", "go previous", "go back option", "last option"],
-    "mute": ["mute", "sound off", "all off", "turn off sound", "turn off the sound", "silence", "mute audio", "turn it off", "stop sound", "mute everything"],
-    "all_sound_off": ["all sound off", "mute all", "mastering silence", "silence with intent", "turn off all sound", "everything off", "all audio off"],
-    "welcome": ["welcome", "welcome experience", "open welcome", "open welcome experience", "show welcome", "go to welcome", "go to welcome experience", "open the welcome", "welcome to", "well come", "pure balanced sound", "welcome guests"],
-    "kitchen": ["kitchen", "kitchen experience", "open kitchen", "open kitchen experience", "show kitchen", "open the kitchen", "cooking zones", "cook zone", "sound for cooking"],
-    "invisible": ["invisible", "invisible experience", "open invisible", "open invisible experience", "show invisible", "open the invisible", "hidden zones", "hidden sound"],
-    "cinema": ["cinema", "cinema experience", "open cinema", "open cinema experience", "show cinema", "open the cinema", "immersive cinema"],
-    "lounge": ["lounge", "entertain", "lounge experience", "open lounge", "open lounge experience", "show lounge", "open the lounge", "relaxing lounge", "lounge and entertain"],
-    "iconic": ["iconic", "iconic design", "iconic design experience", "open iconic", "open iconic experience", "show iconic", "open the iconic"],
-    "open_1": ["open one", "open 1", "open experience one", "open experience 1"],
-    "open_2": ["open two", "open 2", "open experience two", "open experience 2"],
-    "open_3": ["open three", "open 3", "open experience three", "open experience 3"],
-    "open_4": ["open four", "open 4", "open experience four", "open experience 4"],
-    "open_5": ["open five", "open 5", "open experience five", "open experience 5"],
-    "open_6": ["open six", "open 6", "open experience six", "open experience 6"],
-    "open_7": ["open seven", "open 7", "open experience seven", "open experience 7"],
+    "greet": [
+      "hello",
+      "hi",
+      "hey",
+      "are you there",
+      "can you hear me"
+    ],
+    "help": [
+      "help",
+      "what can you do",
+      "what can i say",
+      "commands",
+      "show commands",
+      "options",
+      "list options",
+      "the art of sound",
+      "audio experience suite",
+      "command center",
+      "showroom"
+    ],
+    "bye": [
+      "bye",
+      "goodbye",
+      "thanks",
+      "thank you",
+      "thanks for using jarvis",
+      "see you"
+    ],
+    "back": [
+      "back",
+      "go back",
+      "close",
+      "close this",
+      "close that",
+      "exit",
+      "dismiss",
+      "close the panel",
+      "go back please",
+      "go home",
+      "main menu",
+      "close modal",
+      "close experience"
+    ],
+    "cancel": [
+      "cancel",
+      "never mind",
+      "stop listening",
+      "stop listening now",
+      "cancel listening"
+    ],
+    "next": [
+      "next",
+      "next option",
+      "next one",
+      "move next",
+      "go next",
+      "forward",
+      "move forward",
+      "next choice"
+    ],
+    "previous": [
+      "previous",
+      "prev",
+      "previous option",
+      "go previous",
+      "go back option",
+      "last option",
+      "go back one",
+      "move back",
+      "prior option"
+    ],
+    "mute": [
+      "mute",
+      "sound off",
+      "all off",
+      "turn off sound",
+      "turn off the sound",
+      "silence",
+      "mute audio",
+      "turn it off",
+      "stop sound",
+      "mute everything",
+      "confirm mute",
+      "be quiet",
+      "quiet mode",
+      "mute sound",
+      "silence everything"
+    ],
+    "all_sound_off": [
+      "all sound off",
+      "mute all",
+      "mastering silence",
+      "silence with intent",
+      "turn off all sound",
+      "everything off",
+      "all audio off",
+      "complete silence",
+      "kill all sound",
+      "shut all sound",
+      "turn everything off",
+      "stop all audio"
+    ],
+    "welcome": [
+      "welcome",
+      "welcome experience",
+      "open welcome",
+      "open welcome experience",
+      "show welcome",
+      "go to welcome",
+      "go to welcome experience",
+      "open the welcome",
+      "welcome to",
+      "well come",
+      "pure balanced sound",
+      "welcome guests",
+      "first impressions perfectly calibrated",
+      "entry mode",
+      "arrival mode",
+      "guest welcome",
+      "reception mode",
+      "intro experience"
+    ],
+    "kitchen": [
+      "kitchen",
+      "kitchen experience",
+      "open kitchen",
+      "open kitchen experience",
+      "show kitchen",
+      "open the kitchen",
+      "cooking zones",
+      "cook zone",
+      "sound for cooking",
+      "sound designed for culinary spaces",
+      "cooking experience",
+      "culinary mode",
+      "kitchen mode",
+      "cook mode"
+    ],
+    "invisible": [
+      "invisible",
+      "invisible experience",
+      "open invisible",
+      "open invisible experience",
+      "show invisible",
+      "open the invisible",
+      "hidden zones",
+      "hidden sound",
+      "sound that disappears into architecture",
+      "hidden experience",
+      "hidden mode",
+      "stealth mode",
+      "discreet mode"
+    ],
+    "cinema": [
+      "cinema",
+      "cinema experience",
+      "open cinema",
+      "open cinema experience",
+      "show cinema",
+      "open the cinema",
+      "immersive cinema",
+      "immersive theatrical soundscapes",
+      "movie mode",
+      "theater mode",
+      "home theater",
+      "film mode"
+    ],
+    "lounge": [
+      "lounge",
+      "entertain",
+      "lounge experience",
+      "open lounge",
+      "open lounge experience",
+      "show lounge",
+      "open the lounge",
+      "relaxing lounge",
+      "lounge and entertain",
+      "social spaces sonically perfected",
+      "party mode",
+      "entertain mode",
+      "social mode",
+      "chill mode"
+    ],
+    "iconic": [
+      "iconic",
+      "iconic design",
+      "iconic design experience",
+      "open iconic",
+      "open iconic experience",
+      "show iconic",
+      "open the iconic",
+      "statement pieces in sound",
+      "design mode",
+      "signature mode",
+      "statement mode"
+    ],
+    "open_1": [
+      "open one",
+      "open 1",
+      "open experience one",
+      "open experience 1"
+    ],
+    "open_2": [
+      "open two",
+      "open 2",
+      "open experience two",
+      "open experience 2"
+    ],
+    "open_3": [
+      "open three",
+      "open 3",
+      "open experience three",
+      "open experience 3"
+    ],
+    "open_4": [
+      "open four",
+      "open 4",
+      "open experience four",
+      "open experience 4"
+    ],
+    "open_5": [
+      "open five",
+      "open 5",
+      "open experience five",
+      "open experience 5"
+    ],
+    "open_6": [
+      "open six",
+      "open 6",
+      "open experience six",
+      "open experience 6"
+    ],
+    "open_7": [
+      "open seven",
+      "open 7",
+      "open experience seven",
+      "open experience 7"
+    ],
     "option_1": [
       "option one",
       "option 1",
       "select option one",
       "choose option one",
-      "pick option one"
+      "pick option one",
+      "first option",
+      "number one option"
     ],
     "option_2": [
       "option two",
       "option 2",
       "select option two",
       "choose option two",
-      "pick option two"
+      "pick option two",
+      "second option",
+      "number two option"
     ],
     "option_3": [
       "option three",
@@ -49,58 +269,166 @@
       "select option three",
       "choose option three",
       "pick option three",
-      "silent design focus"
+      "silent design focus",
+      "third option",
+      "number three option"
     ],
-    "opt_soft_welcome": ["soft welcome", "soft welcome volume"],
-    "opt_luxury_ambient": ["luxury ambient", "luxury welcome", "luxury ambient volume"],
-    "opt_background_ambience": ["background ambience", "background ambience volume"],
-    "opt_entertaining_mode": ["entertaining mode", "entertaining mode volume"],
-    "opt_silent": ["silent", "silence"],
-    "opt_invisible_cinema": ["invisible cinema"],
-    "opt_live_performance": ["live performance"],
-    "opt_luxury_apartment_night": ["luxury apartment night"],
-    "opt_background_lounge": ["background lounge", "background lounge volume"],
-    "opt_cocktail_evening": ["cocktail evening", "cocktail evening volume"],
-    "opt_design_focus": ["design focus", "silent design focus", "design focus volume"],
-    "option_4": ["option four", "option 4", "select option four", "choose option four", "pick option four"],
-    "option_5": ["option five", "option 5", "select option five", "choose option five", "pick option five"],
-    "option_6": ["option six", "option 6", "select option six", "choose option six", "pick option six"],
-    "option_7": ["option seven", "option 7", "select option seven", "choose option seven", "pick option seven"],
+    "opt_soft_welcome": [
+      "soft welcome",
+      "soft welcome volume",
+      "soft mode",
+      "soft preset"
+    ],
+    "opt_luxury_ambient": [
+      "luxury ambient",
+      "luxury welcome",
+      "luxury ambient volume",
+      "luxury mode",
+      "luxury preset"
+    ],
+    "opt_background_ambience": [
+      "background ambience",
+      "background ambience volume",
+      "background ambience mode",
+      "ambience mode",
+      "ambient background"
+    ],
+    "opt_entertaining_mode": [
+      "entertaining mode",
+      "entertaining mode volume",
+      "entertaining",
+      "hosting mode",
+      "entertainment mode"
+    ],
+    "opt_silent": [
+      "silent",
+      "silence"
+    ],
+    "opt_invisible_cinema": [
+      "invisible cinema",
+      "quiet cinema",
+      "hidden cinema"
+    ],
+    "opt_live_performance": [
+      "live performance",
+      "concert mode",
+      "live mode"
+    ],
+    "opt_luxury_apartment_night": [
+      "luxury apartment night",
+      "night mode",
+      "apartment night mode"
+    ],
+    "opt_background_lounge": [
+      "background lounge",
+      "background lounge volume",
+      "background lounge mode",
+      "lounge mode"
+    ],
+    "opt_cocktail_evening": [
+      "cocktail evening",
+      "cocktail evening volume",
+      "cocktail",
+      "cocktail mode",
+      "evening mode"
+    ],
+    "opt_design_focus": [
+      "design focus",
+      "silent design focus",
+      "design focus volume",
+      "design mode focus",
+      "focus mode"
+    ],
+    "option_4": [
+      "option four",
+      "option 4",
+      "select option four",
+      "choose option four",
+      "pick option four"
+    ],
+    "option_5": [
+      "option five",
+      "option 5",
+      "select option five",
+      "choose option five",
+      "pick option five"
+    ],
+    "option_6": [
+      "option six",
+      "option 6",
+      "select option six",
+      "choose option six",
+      "pick option six"
+    ],
+    "option_7": [
+      "option seven",
+      "option 7",
+      "select option seven",
+      "choose option seven",
+      "pick option seven"
+    ],
     "volume_up": [
       "volume up",
       "increase volume",
       "increase the volume",
+      "increase music volume",
+      "increase the music volume",
       "increase sound",
       "increase the sound",
       "turn up",
       "turn it up",
       "make it louder",
+      "make the music louder",
+      "make speaker louder",
       "louder",
       "raise volume",
       "raise the volume",
+      "raise the music",
       "volume higher",
       "up the volume",
+      "full volume",
+      "max volume",
+      "maximum volume",
+      "set volume to max",
       "slide volume up",
       "slider up",
-      "volume slider up"
+      "volume slider up",
+      "pump up volume",
+      "make louder",
+      "increase audio",
+      "boost volume",
+      "turn music up"
     ],
     "volume_down": [
       "volume down",
       "decrease volume",
       "decrease the volume",
+      "decrease music volume",
+      "decrease the music volume",
       "decrease sound",
       "decrease the sound",
       "turn down",
       "turn it down",
       "make it quieter",
+      "make the music quieter",
+      "reduce speaker volume",
       "quieter",
       "lower volume",
       "lower the volume",
+      "lower the music",
+      "reduce volume",
       "softer",
       "volume lower",
+      "minimum volume",
+      "set volume to minimum",
       "slide volume down",
       "slider down",
-      "volume slider down"
+      "volume slider down",
+      "drop volume",
+      "make quieter",
+      "decrease audio",
+      "lower sound",
+      "turn music down"
     ]
   },
   "responses": {
