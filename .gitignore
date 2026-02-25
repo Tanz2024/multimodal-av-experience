@@ -43,9 +43,16 @@ tmp/
 temp/
 
 # Large local data / artifacts
-gesture/ml/datasets/
-gesture/ml/artifacts/
-gesture/ml/**/checkpoints/
+models/
+**/models/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.pb
+*.h5
+*.keras
 *.onnx
 *.tflite
 *.wav

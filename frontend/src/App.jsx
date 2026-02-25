@@ -9,21 +9,24 @@ import soundEffects from './utils/soundEffects';
    ═══════════════════════════════════════════════════════════════════════════ */
 
 const SLIDER_MAX = 82.5;
-const ACTION_COOLDOWN_MS = 850;
 const IS_DEV = import.meta.env.DEV;
 const IS_LOCALHOST = ['localhost', '127.0.0.1'].includes(window.location.hostname);
 const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss' : 'ws';
 const WS_ORIGIN = `${WS_PROTOCOL}://${window.location.host}`;
+const HTTP_ORIGIN = window.location.origin;
+const VOICE_BASE_PATH =
+  import.meta.env.VITE_VOICE_BASE_PATH ?? (IS_DEV ? '/voice' : '');
 
 const VOICE_WS_URL =
-  import.meta.env.VITE_VOICE_WS_URL || (IS_DEV ? `${WS_ORIGIN}/voice/ws` : 'ws://localhost:8010/ws');
+  import.meta.env.VITE_VOICE_WS_URL || `${WS_ORIGIN}${VOICE_BASE_PATH}/ws`;
 const VOICE_AUDIO_WS_URL =
-  import.meta.env.VITE_VOICE_AUDIO_WS_URL ||
-  (IS_DEV ? `${WS_ORIGIN}/voice/audio` : 'ws://localhost:8010/audio');
+  import.meta.env.VITE_VOICE_AUDIO_WS_URL || `${WS_ORIGIN}${VOICE_BASE_PATH}/audio`;
 const VOICE_STATUS_URL =
-  import.meta.env.VITE_VOICE_STATUS_URL || (IS_DEV ? '/voice/status' : 'http://localhost:8010/status');
+  import.meta.env.VITE_VOICE_STATUS_URL || `${HTTP_ORIGIN}${VOICE_BASE_PATH}/status`;
 const VOICE_MODELS_URL =
-  import.meta.env.VITE_VOICE_MODELS_URL || (IS_DEV ? '/voice/models' : 'http://localhost:8010/models');
+  import.meta.env.VITE_VOICE_MODELS_URL || `${HTTP_ORIGIN}${VOICE_BASE_PATH}/models`;
+const VOICE_UI_SYNC_URL =
+  import.meta.env.VITE_VOICE_UI_SYNC_URL || `${HTTP_ORIGIN}${VOICE_BASE_PATH}/ui_sync`;
 
 const BACKEND_TTS = String(import.meta.env.VITE_BACKEND_TTS || 'false').toLowerCase() === 'true';
 const FORCE_BROWSER_TTS =
@@ -182,6 +185,10 @@ function pickFemaleVoice(voices) {
   return en[0] || voices[0] || null;
 }
 
+function volumeKey(modalId, optionId) {
+  return `${modalId}:${optionId}`;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    Mode Display Config
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -245,8 +252,6 @@ export default function App() {
   const [modelsData, setModelsData] = useState(null);
 
   // ── Refs (stable across renders) ──────────────────────────────────────────
-  const lastActionAtRef = useRef(0);
-  const lastTouchAtRef = useRef(0);
   const lastExperienceRef = useRef(null);
   const lastIntentSeqRef = useRef(0);
   const hasSeenVoiceStateRef = useRef(false);
@@ -254,7 +259,9 @@ export default function App() {
   const voiceListRef = useRef([]);
   const alwaysListeningRef = useRef(false);
   const applyIntentRef = useRef(null);
-  const handleVoiceCommandRef = useRef(null);
+  const activeModalRef = useRef(null);
+  const activeOptionByModalRef = useRef({});
+  const volumesRef = useRef({});
 
   // ── Browser Mic Refs ──────────────────────────────────────────────────────
   const audioWsRef = useRef(null);
@@ -314,6 +321,18 @@ export default function App() {
   const rmsPct = rms !== null ? Math.min(100, Math.max(0, Math.round(rms * 200))) : null;
   const displayLevel = rmsPct !== null ? rmsPct / 100 : voiceLevel;
 
+  useEffect(() => {
+    activeModalRef.current = activeModal;
+  }, [activeModal]);
+
+  useEffect(() => {
+    activeOptionByModalRef.current = activeOptionByModal;
+  }, [activeOptionByModal]);
+
+  useEffect(() => {
+    volumesRef.current = volumes;
+  }, [volumes]);
+
   /* ─────────────────────────────────────────────────────────────────────────
      TTS (Browser Speech Synthesis)
      ───────────────────────────────────────────────────────────────────────── */
@@ -335,19 +354,50 @@ export default function App() {
      Experience / Option Helpers
      ───────────────────────────────────────────────────────────────────────── */
 
+  const syncUiStateToBackend = useCallback(async (partial) => {
+    try {
+      await fetch(VOICE_UI_SYNC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(partial),
+      });
+    } catch (_) {
+      // Best effort sync only.
+    }
+  }, []);
+
   const openModal = useCallback((id) => {
     setActiveModal(id);
     lastExperienceRef.current = id;
-  }, []);
+    const exp = experiences.find((e) => e.id === id);
+    const defaultOpt = exp?.options?.[0]?.id;
+    if (defaultOpt) {
+      setActiveOptionByModal((prev) => ({ ...prev, [id]: defaultOpt }));
+    }
+    syncUiStateToBackend({
+      selected_experience: id,
+      selected_option: defaultOpt || null,
+    });
+  }, [syncUiStateToBackend]);
 
-  const closeModal = useCallback(() => setActiveModal(null), []);
+  const closeModal = useCallback(() => {
+    setActiveModal(null);
+    syncUiStateToBackend({
+      selected_experience: null,
+      selected_option: null,
+    });
+  }, [syncUiStateToBackend]);
 
   const activateOption = useCallback((modalId, optionId) => {
     setActiveOptionByModal((prev) => ({ ...prev, [modalId]: optionId }));
-  }, []);
+    syncUiStateToBackend({
+      selected_experience: modalId,
+      selected_option: optionId,
+    });
+  }, [syncUiStateToBackend]);
 
-  const updateVolume = useCallback((optionId, value) => {
-    setVolumes((prev) => ({ ...prev, [optionId]: value }));
+  const updateVolume = useCallback((modalId, optionId, value) => {
+    setVolumes((prev) => ({ ...prev, [volumeKey(modalId, optionId)]: value }));
   }, []);
 
   const getDefaultOption = useCallback((modalId) => {
@@ -355,32 +405,30 @@ export default function App() {
     return exp?.options?.[0]?.id ?? null;
   }, []);
 
-  const moveOption = useCallback(
-    (modalId, direction) => {
-      const exp = experiences.find((e) => e.id === modalId);
-      if (!exp || exp.options.length === 0) return;
-      const currentId = activeOptionByModal[modalId] || exp.options[0].id;
-      const idx = exp.options.findIndex((o) => o.id === currentId);
-      const next =
-        direction === 'next'
-          ? (idx + 1) % exp.options.length
-          : (idx - 1 + exp.options.length) % exp.options.length;
-      activateOption(modalId, exp.options[next].id);
-    },
-    [activeOptionByModal, activateOption],
-  );
+  const moveOption = useCallback((modalId, direction) => {
+    const exp = experiences.find((e) => e.id === modalId);
+    if (!exp || exp.options.length === 0) return;
+    const currentMap = activeOptionByModalRef.current || {};
+    const currentId = currentMap[modalId] || exp.options[0].id;
+    const idx = exp.options.findIndex((o) => o.id === currentId);
+    const next =
+      direction === 'next'
+        ? (idx + 1) % exp.options.length
+        : (idx - 1 + exp.options.length) % exp.options.length;
+    activateOption(modalId, exp.options[next].id);
+  }, [activateOption]);
 
-  const adjustActiveVolume = useCallback(
-    (delta) => {
-      if (!activeModal) return;
-      const exp = experiences.find((e) => e.id === activeModal);
-      if (!exp || exp.options.length === 0) return;
-      const currentId = activeOptionByModal[activeModal] || exp.options[0].id;
-      const current = volumes[currentId] || 0;
-      updateVolume(currentId, Math.max(0, Math.min(SLIDER_MAX, current + delta)));
-    },
-    [activeModal, activeOptionByModal, volumes, updateVolume],
-  );
+  const adjustActiveVolume = useCallback((delta) => {
+    const modalId = activeModalRef.current;
+    if (!modalId) return;
+    const exp = experiences.find((e) => e.id === modalId);
+    if (!exp || exp.options.length === 0) return;
+    const currentMap = activeOptionByModalRef.current || {};
+    const currentId = currentMap[modalId] || exp.options[0].id;
+    const volMap = volumesRef.current || {};
+    const current = volMap[volumeKey(modalId, currentId)] || 0;
+    updateVolume(modalId, currentId, Math.max(0, Math.min(SLIDER_MAX, current + delta)));
+  }, [updateVolume]);
 
   const performOpenByIndex = useCallback(
     (index) => {
@@ -397,13 +445,14 @@ export default function App() {
 
   const performSelectOption = useCallback(
     (optIndex) => {
-      if (!activeModal) return false;
-      const exp = experiences.find((e) => e.id === activeModal);
+      const modalId = activeModalRef.current;
+      if (!modalId) return false;
+      const exp = experiences.find((e) => e.id === modalId);
       if (!exp || !exp.options[optIndex]) return false;
-      activateOption(activeModal, exp.options[optIndex].id);
+      activateOption(modalId, exp.options[optIndex].id);
       return true;
     },
-    [activeModal, activateOption],
+    [activateOption],
   );
 
   /* ─────────────────────────────────────────────────────────────────────────
@@ -426,13 +475,14 @@ export default function App() {
         soundEffects.playClick();
         return;
       }
-      if (intent === 'next' && activeModal) {
-        moveOption(activeModal, 'next');
+      const currentModal = activeModalRef.current;
+      if (intent === 'next' && currentModal) {
+        moveOption(currentModal, 'next');
         soundEffects.playClick();
         return;
       }
-      if (intent === 'previous' && activeModal) {
-        moveOption(activeModal, 'prev');
+      if (intent === 'previous' && currentModal) {
+        moveOption(currentModal, 'prev');
         soundEffects.playClick();
         return;
       }
@@ -441,7 +491,7 @@ export default function App() {
       if (intent === 'mute' || intent === 'all_sound_off') {
         const off = experiences.find((e) => e.id === 'off');
         if (off) {
-          setActiveModal(off.id);
+          openModal(off.id);
           activateOption(off.id, off.options[0].id);
         }
         soundEffects.playClick();
@@ -451,15 +501,14 @@ export default function App() {
       // ── Volume ──
       if (intent === 'volume_up' || intent === 'volume_down') {
         const delta = intent === 'volume_up' ? 4.0 : -4.0;
-        if (!activeModal) {
+        if (!activeModalRef.current) {
           const fallback = lastExperienceRef.current || experiences[0].id;
-          setActiveModal(fallback);
-          lastExperienceRef.current = fallback;
+          openModal(fallback);
           const def = getDefaultOption(fallback);
           if (def) {
             activateOption(fallback, def);
-            const current = volumes[def] || 0;
-            updateVolume(def, Math.max(0, Math.min(SLIDER_MAX, current + delta)));
+            const current = (volumesRef.current || {})[volumeKey(fallback, def)] || 0;
+            updateVolume(fallback, def, Math.max(0, Math.min(SLIDER_MAX, current + delta)));
           }
         } else {
           adjustActiveVolume(delta);
@@ -471,10 +520,7 @@ export default function App() {
       // ── Option by label (experience-aware) ──
       if (intent.startsWith('opt_')) {
         const ensureModal = (modalId) => {
-          if (activeModal !== modalId) {
-            setActiveModal(modalId);
-            lastExperienceRef.current = modalId;
-          }
+          if (activeModalRef.current !== modalId) openModal(modalId);
         };
 
         const chooseOption = (modalId, optionId) => {
@@ -482,7 +528,7 @@ export default function App() {
           activateOption(modalId, optionId);
         };
 
-        const within = activeModal || lastExperienceRef.current || null;
+        const within = activeModalRef.current || lastExperienceRef.current || null;
 
         if (intent === 'opt_soft_welcome') {
           chooseOption('welcome', 'soft');
@@ -576,10 +622,9 @@ export default function App() {
       if (intent.startsWith('option_')) {
         const num = Number(intent.replace('option_', ''));
         if (!Number.isNaN(num)) {
-          if (!activeModal) {
+          if (!activeModalRef.current) {
             const fallback = lastExperienceRef.current || experiences[0].id;
-            setActiveModal(fallback);
-            lastExperienceRef.current = fallback;
+            openModal(fallback);
             const exp = experiences.find((e) => e.id === fallback);
             if (exp?.options[num - 1]) {
               activateOption(fallback, exp.options[num - 1].id);
@@ -596,37 +641,20 @@ export default function App() {
       // ── Greet, Help, Bye — no UI action needed, TTS handles it ──
     },
     [
-      activeModal,
       closeModal,
       moveOption,
+      openModal,
       activateOption,
       adjustActiveVolume,
       updateVolume,
-      volumes,
       getDefaultOption,
       performOpenByIndex,
       performSelectOption,
     ],
   );
 
-  const handleVoiceCommand = useCallback(
-    (spoken) => {
-      if (BACKEND_TTS) return;
-      const now = Date.now();
-      if (now - lastActionAtRef.current < ACTION_COOLDOWN_MS) return;
-      if (spoken.includes('back') || spoken.includes('close')) {
-        closeModal();
-        setActionLabel('Back.');
-        lastActionAtRef.current = now;
-        speak('Back.');
-      }
-    },
-    [closeModal, speak],
-  );
-
   // Keep refs current for the WS callback (which has [] deps)
   applyIntentRef.current = applyIntent;
-  handleVoiceCommandRef.current = handleVoiceCommand;
 
   /* ─────────────────────────────────────────────────────────────────────────
      Browser Microphone Streaming
@@ -665,7 +693,7 @@ export default function App() {
     setMicStreamError('');
     setMicStreamStatus('connecting');
 
-    // Create AudioContext synchronously (iOS requires user-gesture context)
+    // Create AudioContext synchronously (iOS requires a direct user interaction)
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     const audioCtx = new AudioCtx();
     audioCtxRef.current = audioCtx;
@@ -754,24 +782,6 @@ export default function App() {
      Effects
      ───────────────────────────────────────────────────────────────────────── */
 
-  // Intro on first tap
-  useEffect(() => {
-    const handler = () => { if (!introDone) startExperience(); };
-    window.addEventListener('pointerdown', handler, { once: true });
-    return () => window.removeEventListener('pointerdown', handler);
-  }, [introDone, startExperience]);
-
-  // Auto-start browser mic on tap (mobile requires user gesture)
-  useEffect(() => {
-    const onPointerDown = () => {
-      lastTouchAtRef.current = Date.now();
-      if (modelsData?.settings?.audio_source !== 'browser') return;
-      if (!audioWsRef.current || audioWsRef.current.readyState > 1) startBrowserMic();
-    };
-    window.addEventListener('pointerdown', onPointerDown, { passive: true });
-    return () => window.removeEventListener('pointerdown', onPointerDown);
-  }, [modelsData, startBrowserMic]);
-
   // Load browser TTS voices
   useEffect(() => {
     const update = () => {
@@ -840,9 +850,6 @@ export default function App() {
             if (st.intent_seq && st.intent_seq !== lastIntentSeqRef.current) {
               lastIntentSeqRef.current = st.intent_seq;
 
-              // Skip if user just tapped the UI (avoid double-action)
-              if (Date.now() - lastTouchAtRef.current < 500) return;
-
               // Apply intent to UI
               applyIntentRef.current?.(st.last_intent);
 
@@ -874,7 +881,6 @@ export default function App() {
               lastVoiceAtRef.current = Date.now();
               setVoiceLevel(1);
               if (shouldBargeIn(spoken)) window.speechSynthesis?.cancel();
-              if (payload.is_final) handleVoiceCommandRef.current?.(spoken);
             }
             return;
           }
@@ -1286,7 +1292,7 @@ export default function App() {
                 {activeExperience.options.map((opt) => {
                   const isActive = activeOptionByModal[activeExperience.id] === opt.id;
                   if (!isActive || !opt.faderLabel) return null;
-                  const value = volumes[opt.id] || 0;
+                  const value = volumes[volumeKey(activeExperience.id, opt.id)] || 0;
                   return (
                     <div
                       key={opt.id}
@@ -1300,7 +1306,9 @@ export default function App() {
                         max={SLIDER_MAX}
                         step="0.01"
                         value={value}
-                        onChange={(e) => updateVolume(opt.id, Number(e.target.value))}
+                        onChange={(e) =>
+                          updateVolume(activeExperience.id, opt.id, Number(e.target.value))
+                        }
                       />
                       <div className="mt-1 text-right text-[10px] text-[#9b9fa6]">
                         {Math.round((value / SLIDER_MAX) * 100)}%

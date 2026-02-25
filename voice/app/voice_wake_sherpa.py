@@ -10,7 +10,7 @@ import time
 from threading import Event, Lock, Thread
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -28,6 +28,7 @@ from .voice_helpers import (
     load_intent_config,
     classify_intent,
     match_intent_contains,
+    match_intent_keywords,
     CommandExecutor,
     AudioDucker,
     play_wav,
@@ -59,10 +60,14 @@ stop_event = Event()
 tts_stop_event = Event()
 
 app = FastAPI()
+CORS_ALLOW_ORIGIN_REGEX = os.getenv(
+    "CORS_ALLOW_ORIGIN_REGEX",
+    r"^https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?$",
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -167,21 +172,37 @@ def _strip_wake_prefix(text: str) -> str:
     if not normalized:
         return ""
 
-    wake_phrases = []
+    wake_phrases: list[str] = []
     if SETTINGS.wake_phrase:
         wake_phrases.append(norm_join(SETTINGS.wake_phrase))
     if SETTINGS.wake_word:
         wake_phrases.append(norm_join(SETTINGS.wake_word))
 
-    wake_phrases = [p for p in wake_phrases if p]
-    for phrase in wake_phrases:
-        if normalized == phrase:
-            return ""
-        prefix = f"{phrase} "
-        if normalized.startswith(prefix):
-            return normalized[len(prefix):].strip()
+    # Remove wake words anywhere in the sentence (not only prefix),
+    # while keeping token boundaries stable.
+    wake_token_lists = [p.split() for p in wake_phrases if p]
+    if not wake_token_lists:
+        return normalized
 
-    return normalized
+    # Prefer longest phrase first (e.g. "hey jarvis" before "jarvis").
+    wake_token_lists.sort(key=len, reverse=True)
+
+    tokens = normalized.split()
+    out_tokens: list[str] = []
+    i = 0
+    while i < len(tokens):
+        matched = False
+        for wt in wake_token_lists:
+            wlen = len(wt)
+            if wlen > 0 and tokens[i:i + wlen] == wt:
+                i += wlen
+                matched = True
+                break
+        if not matched:
+            out_tokens.append(tokens[i])
+            i += 1
+
+    return " ".join(out_tokens).strip()
 
 
 def _load_intent_bundle(path: str):
@@ -225,6 +246,53 @@ def match_intent_exact(text: str, phrases: dict[str, list[str]]) -> str | None:
             if normalized == norm_join(ex):
                 return intent
     return None
+
+
+def _looks_like_command_text(text: str) -> bool:
+    """
+    Heuristic gate for ALWAYS_LISTEN mode so casual speech doesn't trigger
+    repeated "unknown" responses.
+    """
+    toks = set(normalize_tokens(text))
+    if not toks:
+        return False
+    command_tokens = {
+        "welcome",
+        "kitchen",
+        "invisible",
+        "cinema",
+        "lounge",
+        "iconic",
+        "open",
+        "option",
+        "next",
+        "previous",
+        "prev",
+        "back",
+        "cancel",
+        "mute",
+        "silence",
+        "volume",
+        "louder",
+        "quieter",
+        "raise",
+        "lower",
+        "increase",
+        "decrease",
+        "up",
+        "down",
+        "sound",
+        "off",
+        "help",
+        "hello",
+        "hi",
+        "hey",
+        "jarvis",
+    }
+    if toks & command_tokens:
+        return True
+    digits = {"1", "2", "3", "4", "5", "6", "7", "one", "two", "three", "four", "five", "six", "seven"}
+    return bool(toks & digits and ("open" in toks or "option" in toks))
 
 
 class DeepgramStream:
@@ -290,14 +358,30 @@ class DeepgramStream:
         self.connected = True
 
         def _recv_loop():
+            transient_errors = 0
             while self.connected:
                 try:
                     msg = ws.recv()
                 except Exception as exc:
-                    self.events.put({"type": "Error", "error": str(exc)})
+                    err_text = str(exc)
+                    err_low = err_text.lower()
+
+                    # Ignore temporary recv timeouts.
+                    if "timed out" in err_low or "timeout" in err_low:
+                        continue
+
+                    # Retry briefly on likely transient socket issues.
+                    if any(k in err_low for k in ("tempor", "again", "would block", "econnreset", "connection reset")):
+                        transient_errors += 1
+                        if transient_errors <= 3:
+                            time.sleep(0.2)
+                            continue
+
+                    self.events.put({"type": "Error", "error": err_text})
                     break
                 if msg is None:
                     break
+                transient_errors = 0
                 if isinstance(msg, bytes):
                     continue
                 try:
@@ -434,6 +518,7 @@ def tts_worker():
             logger.warning("PIPER_MODEL_PATH not set; skipping TTS")
             continue
 
+        out_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 out_path = tmp.name
@@ -496,12 +581,17 @@ def tts_worker():
 
         finally:
             ducker.unduck()
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
+            if out_path:
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
             # Brief post-TTS silence window so the mic doesn't pick up TTS echo
             if SETTINGS.tts_cooldown_sec > 0:
+                app.state.cooldown_until = max(
+                    float(getattr(app.state, "cooldown_until", 0.0) or 0.0),
+                    time.time() + SETTINGS.tts_cooldown_sec,
+                )
                 time.sleep(SETTINGS.tts_cooldown_sec)
 
 
@@ -723,6 +813,10 @@ def voice_worker(loop):
         nonlocal dg_partial_text, cmd_asr_source
 
         now = time.time()
+        # Respect cooldown requests from other threads (e.g. TTS worker).
+        shared_cooldown_until = float(getattr(app.state, "cooldown_until", 0.0) or 0.0)
+        if shared_cooldown_until > cooldown_until:
+            cooldown_until = shared_cooldown_until
         in_cooldown = now < cooldown_until
         app.state.metrics["audio_frames"] += 1
 
@@ -882,6 +976,9 @@ def voice_worker(loop):
             if not intent:
                 # Substring fallback: catches intent phrases embedded in longer ASR outputs.
                 intent = match_intent_contains(text, intent_phrases)
+            if not intent:
+                # Keyword fallback for robust command handling in noisy environments.
+                intent = match_intent_keywords(text)
             if not intent and intent_classifier is not None:
                 intent, _ = classify_intent(text, intent_classifier, SETTINGS.intent_threshold)
 
@@ -911,6 +1008,14 @@ def voice_worker(loop):
                     utterance_start = None
                     set_mode("LISTENING", now)
                     return
+                if always_listening and not _looks_like_command_text(text):
+                    # Ignore non-command speech in ALWAYS_LISTEN mode.
+                    app.state.session["debug"] = "Ignored non-command speech"
+                    _emit_state()
+                    _reset_cmd_buffer()
+                    utterance_start = None
+                    set_mode("LISTENING", now)
+                    return
 
                 app.state.metrics["asr_errors"] += 1
                 app.state.session["last_intent"] = "unknown"
@@ -923,7 +1028,8 @@ def voice_worker(loop):
                 app.state.session["intent_seq"] += 1
                 _emit_state()
 
-                if app.state.session["last_response"]:
+                # In ALWAYS_LISTEN mode, unknown TTS can become noisy/repetitive.
+                if app.state.session["last_response"] and not always_listening:
                     _enqueue_tts(app.state.session["last_response"])
 
             cooldown_until = now + SETTINGS.cooldown_sec
@@ -992,13 +1098,31 @@ def voice_worker(loop):
             channel = event.get("channel") or {}
             alternatives = channel.get("alternatives") or []
             transcript = ""
+            confidence = None
             if alternatives:
-                transcript = (alternatives[0].get("transcript") or "").strip()
+                first_alt = alternatives[0] or {}
+                transcript = (first_alt.get("transcript") or "").strip()
+                try:
+                    confidence = float(first_alt.get("confidence"))
+                except Exception:
+                    confidence = None
             if not transcript:
                 continue
 
             normalized = norm_join(transcript)
             is_final = bool(event.get("is_final"))
+            event_source = event.get("source") or asr_source or "deepgram"
+            if (
+                is_final
+                and event_source == "deepgram"
+                and confidence is not None
+                and confidence < SETTINGS.asr_min_conf
+            ):
+                app.state.session["debug"] = (
+                    f"Deepgram confidence {confidence:.2f} below ASR_MIN_CONF {SETTINGS.asr_min_conf:.2f}"
+                )
+                _emit_state()
+                continue
             _record_transcript(transcript, is_final, now)
             in_cooldown_now = time.time() < cooldown_until
 
@@ -1032,10 +1156,14 @@ def voice_worker(loop):
 
             if is_final:
                 dg_cmd_finals.append(transcript)
-                cmd_asr_source = (event.get("source") or asr_source or "deepgram")
+                cmd_asr_source = event_source
                 dg_partial_text = ""
+                # ASR endpointing says utterance ended; execute immediately.
+                if wake_active or always_listening:
+                    finalize_command()
+                    break
             else:
-                cmd_asr_source = (event.get("source") or asr_source or "deepgram")
+                cmd_asr_source = event_source
                 dg_partial_text = transcript
 
         if detector.available and not wake_active and not in_cooldown and not always_listening:
@@ -1205,6 +1333,48 @@ async def status():
         "voice_preset": dict(VOICE_PRESET),
         "clients": len(clients),
     })
+
+
+@app.post("/ui_sync")
+async def ui_sync(request: Request):
+    """
+    Sync manual frontend UI state so backend command context stays aligned.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    session = app.state.session
+    changed = False
+
+    if "selected_experience" in payload:
+        exp = payload.get("selected_experience")
+        if exp is None or isinstance(exp, str):
+            session["selected_experience"] = exp
+            changed = True
+
+    if "selected_option" in payload:
+        opt = payload.get("selected_option")
+        if opt is None or isinstance(opt, str):
+            session["selected_option"] = opt
+            changed = True
+
+    if changed:
+        session["navigate"] = None
+        _emit_state()
+
+    return _json_sanitize(
+        {
+            "ok": True,
+            "synced": changed,
+            "selected_experience": session.get("selected_experience"),
+            "selected_option": session.get("selected_option"),
+        }
+    )
 
 
 @app.post("/reload_intents")

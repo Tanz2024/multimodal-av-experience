@@ -16,7 +16,7 @@
     "previous": ["previous", "prev", "previous option", "go previous", "go back option", "last option"],
     "mute": ["mute", "sound off", "all off", "turn off sound", "turn off the sound", "silence", "mute audio", "turn it off", "stop sound", "mute everything"],
     "all_sound_off": ["all sound off", "mute all", "mastering silence", "silence with intent", "turn off all sound", "everything off", "all audio off"],
-    "welcome": ["welcome", "welcome experience", "open welcome", "open welcome experience", "show welcome", "go to welcome", "open the welcome", "pure balanced sound", "welcome guests"],
+    "welcome": ["welcome", "welcome experience", "open welcome", "open welcome experience", "show welcome", "go to welcome", "go to welcome experience", "open the welcome", "welcome to", "well come", "pure balanced sound", "welcome guests"],
     "kitchen": ["kitchen", "kitchen experience", "open kitchen", "open kitchen experience", "show kitchen", "open the kitchen", "cooking zones", "cook zone", "sound for cooking"],
     "invisible": ["invisible", "invisible experience", "open invisible", "open invisible experience", "show invisible", "open the invisible", "hidden zones", "hidden sound"],
     "cinema": ["cinema", "cinema experience", "open cinema", "open cinema experience", "show cinema", "open the cinema", "immersive cinema"],
@@ -70,6 +70,8 @@
       "volume up",
       "increase volume",
       "increase the volume",
+      "increase sound",
+      "increase the sound",
       "turn up",
       "turn it up",
       "make it louder",
@@ -77,12 +79,17 @@
       "raise volume",
       "raise the volume",
       "volume higher",
-      "up the volume"
+      "up the volume",
+      "slide volume up",
+      "slider up",
+      "volume slider up"
     ],
     "volume_down": [
       "volume down",
       "decrease volume",
       "decrease the volume",
+      "decrease sound",
+      "decrease the sound",
       "turn down",
       "turn it down",
       "make it quieter",
@@ -90,7 +97,10 @@
       "lower volume",
       "lower the volume",
       "softer",
-      "volume lower"
+      "volume lower",
+      "slide volume down",
+      "slider down",
+      "volume slider down"
     ]
   },
   "responses": {

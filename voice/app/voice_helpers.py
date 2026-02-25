@@ -1,14 +1,17 @@
 import json
+import logging
 import os
 import re
 import subprocess
 import tempfile
 import time
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 
 DEFAULT_INTENT_CONFIG_PATH = str(Path(__file__).resolve().parents[1] / "config" / "intent_phrases.json")
+logger = logging.getLogger("voice-wake-sherpa")
 
 
 @dataclass
@@ -119,6 +122,22 @@ def _token_similar(a: str, b: str) -> bool:
             edits += 1
         if edits <= 1:
             return True
+    # Handle adjacent transposition errors from ASR ("welocm" vs "welcome").
+    if len(a) == len(b) and len(a) >= 5:
+        diffs = [i for i, (ca, cb) in enumerate(zip(a, b)) if ca != cb]
+        if len(diffs) == 2 and diffs[1] == diffs[0] + 1:
+            i = diffs[0]
+            if a[i] == b[i + 1] and a[i + 1] == b[i]:
+                return True
+    # Last-resort fuzzy similarity (prefer rapidfuzz for speed, fallback to difflib).
+    try:
+        from rapidfuzz import fuzz
+        if len(a) >= 5 and len(b) >= 5 and fuzz.ratio(a, b) >= 82.0:
+            return True
+    except ImportError:
+        if len(a) >= 6 and len(b) >= 6:
+            if SequenceMatcher(None, a, b).ratio() >= 0.82:
+                return True
     return False
 
 
@@ -170,6 +189,45 @@ def match_intent_contains(text: str, phrases: dict[str, list[str]]) -> str | Non
                 best = intent
                 best_len = len(exn)
     return best
+
+
+def match_intent_keywords(text: str) -> str | None:
+    """
+    Keyword fallback for common showroom commands when phrase matching misses.
+    """
+    tokens = set(normalize_tokens(text))
+    if not tokens:
+        return None
+
+    if "welcome" in tokens or ("well" in tokens and "come" in tokens):
+        return "welcome"
+    if "kitchen" in tokens:
+        return "kitchen"
+    if "invisible" in tokens:
+        return "invisible"
+    if "cinema" in tokens:
+        return "cinema"
+    if "lounge" in tokens:
+        return "lounge"
+    if "iconic" in tokens:
+        return "iconic"
+
+    if {"mute", "silence"} & tokens:
+        return "mute"
+    if {"next"} & tokens:
+        return "next"
+    if {"previous", "prev"} & tokens:
+        return "previous"
+    if {"back"} & tokens:
+        return "back"
+
+    if "volume" in tokens or "sound" in tokens:
+        if {"up", "raise", "higher", "increase", "louder"} & tokens:
+            return "volume_up"
+        if {"down", "lower", "decrease", "quieter", "softer"} & tokens:
+            return "volume_down"
+
+    return None
 
 
 DEFAULT_INTENT_PHRASES = {
@@ -269,10 +327,14 @@ class IntentClassifier:
                 from sentence_transformers import SentenceTransformer
                 import numpy as np
 
+                logger.info("Loading NLP embedding model: all-MiniLM-L6-v2")
                 self.model = SentenceTransformer("all-MiniLM-L6-v2")
                 self.embeddings = self.model.encode(self.examples, normalize_embeddings=True)
                 self.np = np
-            except Exception:
+                logger.info("NLP embedding model loaded successfully")
+            except Exception as exc:
+                logger.error("Failed to load NLP model: %s", exc)
+                logger.warning("Falling back to basic string matching")
                 self.model = None
                 self.embeddings = None
 
@@ -322,6 +384,10 @@ def classify_intent(text: str, classifier: IntentClassifier, threshold: float):
 class CommandExecutor:
     def __init__(self, app):
         self.app = app
+        self._system_volume = SystemVolumeController(
+            enabled=os.getenv("SYSTEM_VOLUME_ENABLED", "true").lower() == "true",
+            step=float(os.getenv("SYSTEM_VOLUME_STEP", "0.06")),
+        )
 
     def execute(self, intent: str):
         session = self.app.state.session
@@ -399,6 +465,8 @@ class CommandExecutor:
         elif intent in ("mute", "all_sound_off"):
             session["selected_experience"] = "off"
             session["selected_option"] = "off"
+            self._system_volume.set_muted(True)
+            session["volume"] = 0.0
             session["navigate"] = None
         elif intent in ("back", "cancel"):
             session["selected_experience"] = None
@@ -410,10 +478,18 @@ class CommandExecutor:
         elif intent == "previous":
             session["navigate"] = "previous"
         elif intent == "volume_up":
-            session["volume"] = min(1.0, float(session.get("volume", 0.0)) + 0.1)
+            sys_vol = self._system_volume.change(+1)
+            if sys_vol is not None:
+                session["volume"] = sys_vol
+            else:
+                session["volume"] = min(1.0, float(session.get("volume") or 0.0) + 0.1)
             session["navigate"] = None
         elif intent == "volume_down":
-            session["volume"] = max(0.0, float(session.get("volume", 0.0)) - 0.1)
+            sys_vol = self._system_volume.change(-1)
+            if sys_vol is not None:
+                session["volume"] = sys_vol
+            else:
+                session["volume"] = max(0.0, float(session.get("volume") or 0.0) - 0.1)
             session["navigate"] = None
         elif intent in ("greet", "help", "bye"):
             # No state change needed — TTS response is sufficient
@@ -510,6 +586,119 @@ class AudioDucker:
                 )
             except Exception:
                 return
+
+
+class SystemVolumeController:
+    """
+    Best-effort OS volume controller used by voice intents.
+    """
+
+    def __init__(self, enabled: bool = True, step: float = 0.06):
+        self.enabled = bool(enabled)
+        self.step = max(0.01, min(0.25, float(step)))
+        self._backend = None
+        self._volume = None
+
+    def _init_backend(self):
+        if self._backend is not None:
+            return
+        if os.name == "nt":
+            try:
+                from comtypes import CLSCTX_ALL
+                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self._volume = interface.QueryInterface(IAudioEndpointVolume)
+                self._backend = "pycaw"
+                return
+            except Exception:
+                self._backend = "none"
+                return
+        self._backend = "pactl"
+
+    def _read_pactl_percent(self) -> int | None:
+        try:
+            proc = subprocess.run(
+                ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return None
+            match = re.search(r"(\d+)%", proc.stdout or "")
+            return int(match.group(1)) if match else None
+        except Exception:
+            return None
+
+    def _scalar(self) -> float | None:
+        if not self.enabled:
+            return None
+        self._init_backend()
+        if self._backend == "pycaw" and self._volume is not None:
+            try:
+                return float(self._volume.GetMasterVolumeLevelScalar())
+            except Exception:
+                return None
+        if self._backend == "pactl":
+            pct = self._read_pactl_percent()
+            if pct is None:
+                return None
+            return max(0.0, min(1.0, pct / 100.0))
+        return None
+
+    def set_muted(self, muted: bool) -> bool:
+        if not self.enabled:
+            return False
+        self._init_backend()
+        if self._backend == "pycaw" and self._volume is not None:
+            try:
+                self._volume.SetMute(1 if muted else 0, None)
+                return True
+            except Exception:
+                return False
+        if self._backend == "pactl":
+            try:
+                subprocess.run(
+                    ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if muted else "0"],
+                    check=False,
+                )
+                return True
+            except Exception:
+                return False
+        return False
+
+    def change(self, direction: int) -> float | None:
+        if not self.enabled:
+            return None
+        step = self.step if direction >= 0 else -self.step
+        self._init_backend()
+        if self._backend == "pycaw" and self._volume is not None:
+            try:
+                cur = float(self._volume.GetMasterVolumeLevelScalar())
+                tgt = max(0.0, min(1.0, cur + step))
+                self._volume.SetMute(0, None)
+                self._volume.SetMasterVolumeLevelScalar(tgt, None)
+                return tgt
+            except Exception:
+                return None
+        if self._backend == "pactl":
+            try:
+                pct = int(round(abs(step) * 100))
+                signed = f"+{pct}%" if direction >= 0 else f"-{pct}%"
+                subprocess.run(
+                    ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"],
+                    check=False,
+                )
+                subprocess.run(
+                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", signed],
+                    check=False,
+                )
+                return self._scalar()
+            except Exception:
+                return None
+        return None
 
 
 def play_wav(path: str, stop_flag: Event):

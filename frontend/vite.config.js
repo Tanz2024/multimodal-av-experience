@@ -66,7 +66,6 @@ export default defineConfig(({ mode }) => {
   };
 
   const voiceTarget = env.VOICE_PROXY_TARGET || 'http://127.0.0.1:8010';
-  const gestureTarget = env.GESTURE_PROXY_TARGET || 'http://127.0.0.1:8000';
   // Default to HTTPS so mobile can use mic permissions (secure context).
   // Override with VITE_HTTPS=false if you explicitly need plain HTTP.
   const useHttps = String(env.VITE_HTTPS ?? 'true').toLowerCase() === 'true';
@@ -99,13 +98,6 @@ export default defineConfig(({ mode }) => {
           target: voiceTarget,
           changeOrigin: true,
           configure: makeProxyHandler('voice-status'),
-        },
-        '/gesture': {
-          target: gestureTarget,
-          changeOrigin: true,
-          ws: true,
-          rewrite: (path) => path.replace(/^\/gesture/, ''),
-          configure: makeProxyHandler('gesture'),
         },
       },
     },
