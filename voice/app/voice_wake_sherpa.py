@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import random
+from collections import deque
 from threading import Event, Lock, Thread
 from urllib.parse import urlencode
 
@@ -38,6 +39,7 @@ from .voice_helpers import (
     resolve_input_channels,
     resolve_openwakeword_model_path,
     OpenWakeWordDetector,
+    MicrosoftKeywordDetector,
     NoiseReducer,
     VOICE_PRESET,
 )
@@ -68,6 +70,7 @@ CONFIRM_FOR_INTENTS = {
 }
 COMMAND_RATE_LIMIT_SEC = float(os.getenv("COMMAND_RATE_LIMIT_SEC", "0.35"))
 COMMAND_DEBOUNCE_SEC = float(os.getenv("COMMAND_DEBOUNCE_SEC", "1.0"))
+COMMAND_TEXT_DEBOUNCE_SEC = float(os.getenv("COMMAND_TEXT_DEBOUNCE_SEC", "2.0"))
 COMMAND_QUEUE_MAX = int(os.getenv("COMMAND_QUEUE_MAX", "100"))
 COMMAND_TIMEOUT_SEC = float(os.getenv("COMMAND_TIMEOUT_SEC", "0.8"))
 COMMAND_MAX_RETRIES = int(os.getenv("COMMAND_MAX_RETRIES", "2"))
@@ -110,6 +113,8 @@ app.state.last_sent_ts = None
 app.state.voice_ok = False
 app.state.mode = "SLEEPING"
 app.state.cooldown_until = 0.0
+app.state.tts_playing = False
+app.state.last_tts_text = ""
 app.state.noise_reducer = None
 app.state.session = {
     "mode": "SLEEPING",
@@ -140,6 +145,10 @@ app.state.session = {
     "pending_confirmation": None,
     "command_log": [],
     "last_action": None,
+    "last_tts_backend": "",
+    "last_tts_error": "",
+    "last_tts_text": "",
+    "tts_playing": False,
 }
 app.state.metrics = {
     "last_wake_ts": 0.0,
@@ -170,6 +179,8 @@ app.state.metrics = {
 app.state.last_command_ts = 0.0
 app.state.last_intent = ""
 app.state.last_intent_ts = 0.0
+app.state.last_command_text = ""
+app.state.last_command_text_ts = 0.0
 app.state.pending_confirmation = None
 
 
@@ -213,6 +224,24 @@ def _emit_state():
 def _enqueue_tts(text: str):
     if not SETTINGS.tts_enabled:
         return
+    text = str(text or "").strip()
+    if not text:
+        return
+    # When rapid wake/intent events produce the same phrase, avoid replaying
+    # the exact text if it is already in-flight.
+    if app.state.tts_playing and getattr(app.state, "last_tts_text", "") == text:
+        return
+    app.state.last_tts_text = text
+    app.state.session["last_tts_text"] = text
+    # Keep TTS aligned with the latest command: interrupt current playback
+    # and drop older queued responses to avoid stale/out-of-order speech.
+    tts_stop_event.set()
+    while True:
+        try:
+            _ = tts_queue.get_nowait()
+            tts_queue.task_done()
+        except queue.Empty:
+            break
     tts_queue.put(text)
 
 
@@ -280,11 +309,7 @@ def _strip_wake_prefix(text: str) -> str:
     if not normalized:
         return ""
 
-    wake_phrases: list[str] = []
-    if SETTINGS.wake_phrase:
-        wake_phrases.append(norm_join(SETTINGS.wake_phrase))
-    if SETTINGS.wake_word:
-        wake_phrases.append(norm_join(SETTINGS.wake_word))
+    wake_phrases = _wake_phrase_variants()
 
     # Remove wake words anywhere in the sentence (not only prefix),
     # while keeping token boundaries stable.
@@ -292,7 +317,7 @@ def _strip_wake_prefix(text: str) -> str:
     if not wake_token_lists:
         return normalized
 
-    # Prefer longest phrase first (e.g. "hey jarvis" before "jarvis").
+    # Prefer longest phrase first (e.g. "hey tom" before "tom").
     wake_token_lists.sort(key=len, reverse=True)
 
     tokens = normalized.split()
@@ -311,6 +336,49 @@ def _strip_wake_prefix(text: str) -> str:
             i += 1
 
     return " ".join(out_tokens).strip()
+
+
+def _wake_token_aliases(token: str) -> list[str]:
+    t = norm_join(token)
+    if not t:
+        return []
+    aliases = {t}
+    # Tolerate common ASR variants for the same wake pronunciation.
+    if t in {"tom", "thom"}:
+        aliases.update({"tom", "thom"})
+    return [a for a in aliases if a]
+
+
+def _wake_phrase_variants() -> list[str]:
+    variants: set[str] = set()
+    base_phrases: list[str] = []
+    if SETTINGS.wake_phrase:
+        base_phrases.append(norm_join(SETTINGS.wake_phrase))
+    if SETTINGS.wake_word:
+        base_phrases.append(norm_join(SETTINGS.wake_word))
+
+    for phrase in base_phrases:
+        toks = [t for t in phrase.split() if t]
+        if not toks:
+            continue
+        if len(toks) == 1:
+            for a in _wake_token_aliases(toks[0]):
+                variants.add(a)
+            continue
+        if len(toks) == 2:
+            a0 = _wake_token_aliases(toks[0]) or [toks[0]]
+            a1 = _wake_token_aliases(toks[1]) or [toks[1]]
+            for x in a0:
+                for y in a1:
+                    variants.add(f"{x} {y}".strip())
+            # Also include just the wake word part for lenient fallback.
+            for y in a1:
+                variants.add(y)
+            continue
+        variants.add(" ".join(toks))
+
+    # Deterministic ordering: prefer longer phrases first.
+    return sorted(variants, key=lambda p: len(p.split()), reverse=True)
 
 
 def _load_intent_bundle(path: str):
@@ -336,6 +404,8 @@ def _load_intent_bundles():
 
 INTENT_BUNDLES = _load_intent_bundles()
 VOICE_PRESET = dict(INTENT_BUNDLES.get("deepgram", {}).get("voice_preset", VOICE_PRESET))
+_WAKE_RESPONSES = ["How may I help you?", "What's next?", "Ready, go ahead.", "Listening.", "What can I do?"]
+_wake_response_idx = 0
 executor = CommandExecutor(app)
 command_adapter = _adapter()
 
@@ -344,6 +414,7 @@ def _enqueue_command_action(intent: str, text: str, confidence: float, source: s
     now = time.time()
     # Emergency commands bypass debounce/rate-limit.
     emergency = intent in {"all_sound_off", "mute"}
+    norm_text = norm_join(text or "")
 
     if (not emergency) and (now - app.state.last_command_ts) < COMMAND_RATE_LIMIT_SEC:
         app.state.metrics["cmd_rate_limited"] += 1
@@ -356,6 +427,17 @@ def _enqueue_command_action(intent: str, text: str, confidence: float, source: s
         app.state.metrics["cmd_debounced"] += 1
         app.state.session["debug"] = "Command ignored (debounced)"
         _log_command_event("debounced", intent=intent, text=text)
+        _emit_state()
+        return False
+    if (
+        (not emergency)
+        and norm_text
+        and norm_text == app.state.last_command_text
+        and (now - app.state.last_command_text_ts) < COMMAND_TEXT_DEBOUNCE_SEC
+    ):
+        app.state.metrics["cmd_debounced"] += 1
+        app.state.session["debug"] = "Command ignored (repeat transcript)"
+        _log_command_event("debounced_text", intent=intent, text=text)
         _emit_state()
         return False
 
@@ -388,6 +470,8 @@ def _enqueue_command_action(intent: str, text: str, confidence: float, source: s
     app.state.last_command_ts = now
     app.state.last_intent = intent
     app.state.last_intent_ts = now
+    app.state.last_command_text = norm_text
+    app.state.last_command_text_ts = now
     _log_command_event("queued", intent=intent, confidence=round(float(confidence or 0.0), 3), source=source)
     _emit_state()
     return True
@@ -484,10 +568,33 @@ COMMAND_GATE_BASE_TOKENS = {
     "sound",
     "off",
     "help",
+    "command",
+    "commands",
+    "show",
+    "start",
+    "launch",
+    "select",
+    "choose",
+    "pick",
+    "experience",
+    "experiences",
+    "menu",
+    "home",
+    "screen",
+    "panel",
+    "movie",
+    "theater",
+    "theatre",
+    "film",
+    "cook",
+    "cooking",
+    "party",
+    "entertainment",
+    "design",
     "hello",
     "hi",
     "hey",
-    "jarvis",
+    "tom",
 }
 COMMAND_GATE_IGNORE_TOKENS = {
     "the",
@@ -504,6 +611,62 @@ COMMAND_GATE_IGNORE_TOKENS = {
     "please",
 }
 COMMAND_HINT_TOKENS = set(COMMAND_GATE_BASE_TOKENS)
+
+EXPERIENCE_OPTION_LABELS = {
+    "welcome": ["Soft Welcome", "Luxury Ambient"],
+    "kitchen": ["Silent", "Background Ambience", "Entertaining Mode"],
+    "invisible": ["Silent", "Background Ambience", "Entertaining Mode"],
+    "cinema": ["Invisible Cinema", "Live Performance", "Luxury Apartment Night"],
+    "lounge": ["Background Lounge", "Cocktail Evening", "Silent Design Focus"],
+    "iconic": ["Background Lounge", "Cocktail Evening", "Silent Design Focus"],
+    "off": ["Confirm Mute"],
+}
+
+
+def _contextual_intent_from_text(text: str, current_experience: str | None) -> str | None:
+    """
+    Map short follow-up utterances (e.g. "soft", "cocktail", "live") to option
+    intents based on the currently selected experience.
+    """
+    exp = str(current_experience or "").strip().lower()
+    if not exp:
+        return None
+
+    tokens = set(normalize_tokens(text))
+    if not tokens:
+        return None
+
+    if exp == "welcome":
+        if tokens & {"soft", "gentle", "warm"}:
+            return "opt_soft_welcome"
+        if tokens & {"luxury", "ambient", "premium"}:
+            return "opt_luxury_ambient"
+
+    if exp in {"kitchen", "invisible"}:
+        if tokens & {"silent", "silence", "quiet"}:
+            return "opt_silent"
+        if tokens & {"ambience", "ambiance", "background"}:
+            return "opt_background_ambience"
+        if tokens & {"entertaining", "entertain", "party"}:
+            return "opt_entertaining_mode"
+
+    if exp == "cinema":
+        if tokens & {"invisible"}:
+            return "opt_invisible_cinema"
+        if tokens & {"live", "performance"}:
+            return "opt_live_performance"
+        if tokens & {"luxury", "apartment", "night"}:
+            return "opt_luxury_apartment_night"
+
+    if exp in {"lounge", "iconic"}:
+        if tokens & {"background", "lounge"}:
+            return "opt_background_lounge"
+        if tokens & {"cocktail", "evening"}:
+            return "opt_cocktail_evening"
+        if tokens & {"design", "focus", "silent"}:
+            return "opt_design_focus"
+
+    return None
 
 
 def _refresh_command_hint_tokens():
@@ -748,83 +911,167 @@ class VoskStream:
 
 def tts_worker():
     ducker = AudioDucker(SETTINGS)
+
+    def _synthesize_azure(text: str, out_path: str) -> tuple[bool, str]:
+        key = (SETTINGS.azure_tts_key_1 or SETTINGS.azure_tts_key_2 or "").strip()
+        region = (SETTINGS.speech_region or "").strip()
+        if not key:
+            return False, "Azure TTS key is not set"
+        if not region:
+            return False, "SPEECH_REGION is not set"
+
+        try:
+            import azure.cognitiveservices.speech as speechsdk
+        except Exception as exc:
+            return False, f"azure-cognitiveservices-speech import failed: {exc}"
+
+        try:
+            speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
+            if SETTINGS.azure_tts_voice:
+                speech_config.speech_synthesis_voice_name = SETTINGS.azure_tts_voice
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
+            )
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=out_path)
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=speech_config,
+                audio_config=audio_config,
+            )
+            result = synthesizer.speak_text_async(text).get()
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                return True, ""
+            if result.reason == speechsdk.ResultReason.Canceled:
+                details = speechsdk.SpeechSynthesisCancellationDetails.from_result(result)
+                return False, f"Azure synthesis canceled: reason={details.reason} error={details.error_details!r}"
+            return False, f"Azure synthesis failed with reason={result.reason}"
+        except Exception as exc:
+            return False, f"Azure synthesis exception: {exc}"
+
+    def _synthesize_piper(text: str, out_path: str) -> tuple[bool, str]:
+        preset_model_path = VOICE_PRESET.get("model_path", "")
+        model_path = preset_model_path or SETTINGS.piper_model_path
+        if not model_path:
+            return False, "PIPER_MODEL_PATH not set"
+
+        length_scale = str(VOICE_PRESET.get("length_scale", SETTINGS.piper_length_scale))
+        noise_scale = VOICE_PRESET.get("noise_scale", SETTINGS.piper_noise_scale)
+        noise_w = VOICE_PRESET.get("noise_w", SETTINGS.piper_noise_w)
+
+        cmd = [
+            SETTINGS.piper_path,
+            "--model",
+            model_path,
+            "--output_file",
+            out_path,
+            "--length_scale",
+            length_scale,
+        ]
+        if noise_scale not in (None, ""):
+            cmd.extend(["--noise_scale", str(noise_scale)])
+        if noise_w not in (None, ""):
+            cmd.extend(["--noise_w", str(noise_w)])
+        if SETTINGS.piper_speaker:
+            cmd.extend(["--speaker", SETTINGS.piper_speaker])
+
+        proc = subprocess.run(
+            cmd,
+            input=text.encode("utf-8"),
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or b"")[:4000].decode("utf-8", errors="replace").strip()
+            out = (proc.stdout or b"")[:2000].decode("utf-8", errors="replace").strip()
+            return False, f"Piper exited with code {proc.returncode}. stderr={err!r} stdout={out!r}"
+        return True, ""
+
     while not stop_event.is_set():
         text = tts_queue.get()
         if text is None:
             break
         if not SETTINGS.tts_enabled:
             continue
-        if SETTINGS.tts_backend != "piper":
-            continue
 
-        preset_model_path = VOICE_PRESET.get("model_path", "")
-        model_path = preset_model_path or SETTINGS.piper_model_path
-        if not model_path:
-            logger.warning("PIPER_MODEL_PATH not set; skipping TTS")
-            continue
+        app.state.tts_playing = False
+        app.state.session["tts_playing"] = False
+        app.state.session["last_tts_backend"] = ""
+        app.state.session["last_tts_error"] = ""
 
         out_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 out_path = tmp.name
 
-            length_scale = str(VOICE_PRESET.get("length_scale", SETTINGS.piper_length_scale))
-            noise_scale = VOICE_PRESET.get("noise_scale", SETTINGS.piper_noise_scale)
-            noise_w = VOICE_PRESET.get("noise_w", SETTINGS.piper_noise_w)
-
-            cmd = [
-                SETTINGS.piper_path,
-                "--model",
-                model_path,
-                "--output_file",
-                out_path,
-                "--length_scale",
-                length_scale,
-            ]
-            if noise_scale not in (None, ""):
-                cmd.extend(["--noise_scale", str(noise_scale)])
-            if noise_w not in (None, ""):
-                cmd.extend(["--noise_w", str(noise_w)])
-            if SETTINGS.piper_speaker:
-                cmd.extend(["--speaker", SETTINGS.piper_speaker])
-
             ducker.duck()
             tts_stop_event.clear()
             app.state.metrics["last_tts_ts"] = time.time()
+            synth_started_ts = time.time()
 
-            proc = subprocess.run(
-                cmd,
-                input=text.encode("utf-8"),
-                capture_output=True,
-                check=False,
-            )
-            if proc.returncode != 0:
+            ok = False
+            err = ""
+            backend = (SETTINGS.tts_backend or "piper").strip().lower()
+
+            # `azure`/`auto`: Azure primary, Piper fallback.
+            # `piper`: Piper only.
+            if backend in {"azure", "auto"}:
+                app.state.session["last_tts_backend"] = "azure"
+                ok, azure_err = _synthesize_azure(text, out_path)
+                if not ok:
+                    logger.warning("Azure TTS failed, falling back to Piper: %s", azure_err)
+                    app.state.session["last_tts_backend"] = "piper"
+                    ok, piper_err = _synthesize_piper(text, out_path)
+                    if not ok:
+                        err = f"Azure failed: {azure_err} | Piper failed: {piper_err}"
+                        app.state.session["last_tts_error"] = err
+            else:
+                app.state.session["last_tts_backend"] = "piper"
+                ok, err = _synthesize_piper(text, out_path)
+                if not ok:
+                    app.state.session["last_tts_error"] = err
+
+            if not ok:
                 app.state.metrics["tts_errors"] += 1
-                err = (proc.stderr or b"")[:4000].decode("utf-8", errors="replace").strip()
-                out = (proc.stdout or b"")[:2000].decode("utf-8", errors="replace").strip()
-                logger.warning("Piper exited with code %s. stderr=%r stdout=%r", proc.returncode, err, out)
+                logger.warning("TTS synthesis failed: %s", err)
                 continue
+            logger.info(
+                "TTS synthesis ok backend=%s synth_ms=%.1f text_len=%d",
+                app.state.session.get("last_tts_backend", ""),
+                (time.time() - synth_started_ts) * 1000.0,
+                len(text or ""),
+            )
 
             try:
                 if (not os.path.isfile(out_path)) or (os.path.getsize(out_path) <= 0):
                     app.state.metrics["tts_errors"] += 1
+                    app.state.session["last_tts_error"] = "output wav missing/empty"
                     logger.warning("TTS output wav missing/empty: %s", out_path)
                     continue
             except Exception as exc:
                 app.state.metrics["tts_errors"] += 1
+                app.state.session["last_tts_error"] = f"output wav check failed: {exc}"
                 logger.warning("TTS output wav check failed: %s", exc)
                 continue
 
+            app.state.tts_playing = True
+            app.state.session["tts_playing"] = True
+            _emit_state()
             ok = play_wav(out_path, tts_stop_event)
             if not ok:
                 app.state.metrics["tts_errors"] += 1
+                app.state.session["last_tts_error"] = "playback failed"
                 logger.warning("TTS playback failed")
+            else:
+                if not app.state.session.get("last_tts_error"):
+                    app.state.session["last_tts_error"] = ""
 
         except Exception as exc:
             app.state.metrics["tts_errors"] += 1
+            app.state.session["last_tts_error"] = f"tts worker exception: {exc}"
             logger.warning("TTS failed: %s", exc)
 
         finally:
+            app.state.tts_playing = False
+            app.state.session["tts_playing"] = False
             ducker.unduck()
             if out_path:
                 try:
@@ -889,14 +1136,24 @@ def voice_worker(loop):
         except Exception:
             return audio_f32
 
-    detector = OpenWakeWordDetector(
-        SETTINGS.wakeword_model_path,
-        threshold=SETTINGS.wakeword_threshold,
-    )
-    if detector.available:
-        logger.info("OpenWakeWord loaded: %s", SETTINGS.wakeword_model_path)
+    resolved_wake_model_path, _ = resolve_openwakeword_model_path(SETTINGS.wakeword_model_path)
+    using_microsoft_keyword = str(resolved_wake_model_path).lower().endswith(".table")
+    if using_microsoft_keyword:
+        detector = MicrosoftKeywordDetector(SETTINGS.wakeword_model_path)
+        if detector.available:
+            logger.info("Microsoft keyword model loaded: %s", SETTINGS.wakeword_model_path)
+        else:
+            err = getattr(detector, "last_error", "") or "unknown error"
+            logger.warning("Microsoft keyword model unavailable (%s). Fallback to Deepgram wake phrase.", err)
     else:
-        logger.warning("OpenWakeWord not available. Fallback to Deepgram wake phrase.")
+        detector = OpenWakeWordDetector(
+            SETTINGS.wakeword_model_path,
+            threshold=SETTINGS.wakeword_threshold,
+        )
+        if detector.available:
+            logger.info("OpenWakeWord loaded: %s", SETTINGS.wakeword_model_path)
+        else:
+            logger.warning("OpenWakeWord not available. Fallback to Deepgram wake phrase.")
 
     audio_source = SETTINGS.audio_source
     always_listening = SETTINGS.always_listening or SETTINGS.wake_word == ""
@@ -911,6 +1168,11 @@ def voice_worker(loop):
     else:
         device = resolve_device(SETTINGS)
         input_sample_rate = resolve_sample_rate(SETTINGS, device)
+
+    # Keep ~500ms of recent audio so first command words are not clipped on wake.
+    frame_sec = float(SETTINGS.block_size) / max(1.0, float(target_sample_rate))
+    pre_roll_frames = max(2, min(12, int(round(0.5 / max(0.01, frame_sec)))))
+    pre_roll_buffer = deque(maxlen=pre_roll_frames)
 
     noise_reducer = NoiseReducer(SETTINGS, target_sample_rate)
     app.state.noise_reducer = noise_reducer
@@ -943,9 +1205,13 @@ def voice_worker(loop):
 
     executing_until = 0.0
     executing_hold_sec = float(os.getenv("EXECUTING_HOLD_SEC", "0.2"))
+    non_command_prompt_cooldown_sec = float(os.getenv("NON_COMMAND_PROMPT_COOLDOWN_SEC", "3.0"))
+    last_non_command_prompt_ts = 0.0
 
     app.state.voice_ok = True
     wake_prompt_block_sec = float(os.getenv("WAKE_PROMPT_BLOCK_SEC", "1.2"))
+    followup_listen_sec = float(os.getenv("FOLLOWUP_LISTEN_SEC", "12.0"))
+    enable_barge_in = os.getenv("ENABLE_BARGE_IN", "true").lower() == "true"
 
     def set_mode(new_mode: str, now: float):
         if app.state.mode == new_mode:
@@ -964,6 +1230,7 @@ def voice_worker(loop):
     dg_partial_text = ""
     dg_cmd_finals: list[str] = []
     cmd_asr_source = "deepgram"
+    wake_phrases = _wake_phrase_variants()
 
     def _ensure_deepgram(now_ts: float) -> bool:
         nonlocal deepgram, dg_next_connect_ts
@@ -999,6 +1266,20 @@ def voice_worker(loop):
         dg_partial_text = ""
         dg_cmd_finals = []
         cmd_asr_source = "deepgram"
+
+    def _intent_response(intent: str, fallback_responses: dict) -> str:
+        if not intent:
+            return ""
+        if intent.startswith("option_"):
+            try:
+                idx = int(intent.replace("option_", "")) - 1
+            except Exception:
+                idx = -1
+            exp = str(app.state.session.get("selected_experience") or "")
+            labels = EXPERIENCE_OPTION_LABELS.get(exp) or []
+            if 0 <= idx < len(labels):
+                return f"Selecting {labels[idx]}."
+        return str(fallback_responses.get(intent, ""))
 
     def _record_transcript(text: str, is_final: bool, now_ts: float):
         if not text:
@@ -1046,15 +1327,23 @@ def voice_worker(loop):
         )
         app.state.session["last_intent"] = "greet"
         _emit_state()
-        _enqueue_tts(app.state.session["last_response"])
-        if wake_prompt_block_sec > 0:
+        # In ALWAYS_LISTEN mode, greet handling comes from command finalization.
+        # Speaking here as well causes duplicate wake talkback.
+        if not always_listening:
+            _enqueue_tts(app.state.session["last_response"])
+        if wake_prompt_block_sec > 0 and not always_listening:
             cooldown_until = max(cooldown_until, now_ts + wake_prompt_block_sec)
             app.state.cooldown_until = cooldown_until
+        # Push pre-roll frames into ASR stream so we keep words said right after wake.
+        if _ensure_deepgram(now_ts) and deepgram is not None and deepgram.connected:
+            for frame in pre_roll_buffer:
+                deepgram.send_audio(frame)
 
     def handle_frame(data):
         nonlocal wake_active, wake_start, listen_until, cooldown_until, last_partial_ts, last_rms_emit
         nonlocal fallback_hits, fallback_window_start, utterance_start, last_speech_ts
         nonlocal executing_until, deepgram, dg_next_connect_ts
+        nonlocal last_non_command_prompt_ts
         nonlocal dg_partial_text, cmd_asr_source
 
         now = time.time()
@@ -1135,6 +1424,7 @@ def voice_worker(loop):
         except Exception:
             app.state.session["voice_rms_norm"] = None
         data_norm = (audio_f32n * 32767.0).astype(np.int16).tobytes()
+        pre_roll_buffer.append(data_norm)
 
         def reset_listening(to_idle: bool = True):
             nonlocal wake_active, utterance_start, last_speech_ts, listen_until
@@ -1148,7 +1438,7 @@ def voice_worker(loop):
                 set_mode("SLEEPING", now)
 
         def finalize_command():
-            nonlocal cooldown_until, wake_active, utterance_start
+            nonlocal cooldown_until, wake_active, utterance_start, listen_until
             nonlocal executing_until
 
             if not always_listening and app.state.mode != "LISTENING":
@@ -1179,15 +1469,12 @@ def voice_worker(loop):
                 text = intent_text
                 normalized_text = intent_text
 
-            # In ALWAYS_LISTEN mode, treat a short "jarvis"/"hey jarvis" as a greet so the
+            # In ALWAYS_LISTEN mode, treat a short "tom"/"hey tom" as a greet so the
             # system still provides the talkback prompt users expect.
             if (
                 always_listening
                 and len(normalized_text.split()) <= 3
-                and (
-                    (SETTINGS.wake_phrase and norm_join(SETTINGS.wake_phrase) in normalized_text)
-                    or (SETTINGS.wake_word and norm_join(SETTINGS.wake_word) in normalized_text)
-                )
+                and any(wp and wp in normalized_text for wp in wake_phrases)
             ):
                 app.state.session["last_intent"] = "greet"
                 app.state.session["last_response"] = SETTINGS.wake_response
@@ -1282,6 +1569,12 @@ def voice_worker(loop):
                 intent = match_intent_keywords(text)
                 if intent:
                     intent_conf = 0.88
+            if not intent:
+                # Context fallback: allow short option words after choosing an experience.
+                current_exp = app.state.session.get("selected_experience")
+                intent = _contextual_intent_from_text(text, current_exp)
+                if intent:
+                    intent_conf = 0.86
             if not intent and intent_classifier is not None:
                 intent, intent_conf = classify_intent(text, intent_classifier, SETTINGS.intent_threshold)
 
@@ -1326,7 +1619,7 @@ def voice_worker(loop):
                     return
 
                 app.state.session["last_intent"] = intent
-                app.state.session["last_response"] = intent_responses.get(intent, "")
+                app.state.session["last_response"] = _intent_response(intent, intent_responses)
                 app.state.session["last_final"] = text
                 app.state.session["debug"] = ""
                 app.state.session["intent_seq"] += 1
@@ -1351,9 +1644,24 @@ def voice_worker(loop):
                     set_mode("LISTENING", now)
                     return
                 if always_listening and not _looks_like_command_text(text):
-                    # Ignore non-command speech in ALWAYS_LISTEN mode.
+                    # In ALWAYS_LISTEN mode, provide a throttled prompt so users know
+                    # the mic is active and what kind of utterance is expected.
+                    app.state.metrics["asr_errors"] += 1
+                    app.state.session["last_intent"] = "unknown"
+                    app.state.session["last_final"] = text
+                    app.state.session["last_response"] = intent_responses.get(
+                        "unknown",
+                        "I did not understand that. Please try a showroom command.",
+                    )
                     app.state.session["debug"] = "Ignored non-command speech"
+                    app.state.session["intent_seq"] += 1
                     _emit_state()
+                    if (
+                        app.state.session["last_response"]
+                        and (now - last_non_command_prompt_ts) >= max(0.2, non_command_prompt_cooldown_sec)
+                    ):
+                        _enqueue_tts(app.state.session["last_response"])
+                        last_non_command_prompt_ts = now
                     _reset_cmd_buffer()
                     utterance_start = None
                     set_mode("LISTENING", now)
@@ -1374,12 +1682,27 @@ def voice_worker(loop):
                 if app.state.session["last_response"] and not always_listening:
                     _enqueue_tts(app.state.session["last_response"])
 
+            keep_followup_session = bool(
+                (not always_listening)
+                and intent
+                and intent not in {"cancel", "bye", "back", "all_sound_off", "mute"}
+            )
+
             cooldown_until = now + SETTINGS.cooldown_sec
             app.state.cooldown_until = cooldown_until
             if always_listening:
                 set_mode("LISTENING", now)
                 _reset_cmd_buffer()
                 wake_active = True
+            elif keep_followup_session:
+                # Keep listening for short follow-up commands like:
+                # "hey tom welcome" -> "soft" -> "volume up".
+                wake_active = True
+                listen_until = now + max(1.5, followup_listen_sec)
+                app.state.session["listen_until"] = listen_until
+                set_mode("LISTENING", now)
+                _reset_cmd_buffer()
+                utterance_start = None
             else:
                 set_mode("EXECUTING", now)
                 executing_until = now + max(0.05, min(0.5, executing_hold_sec))
@@ -1391,8 +1714,8 @@ def voice_worker(loop):
             or wake_active
             or in_cooldown
             or (not detector.available)
+            or (rms_raw > (SETTINGS.noise_gate_rms * 0.7))
         )
-
         if needs_asr_stream:
             if _ensure_deepgram(now):
                 deepgram.send_audio(data_norm)
@@ -1454,6 +1777,7 @@ def voice_worker(loop):
                 continue
 
             normalized = norm_join(transcript)
+            wake_match = any(wp and wp in normalized for wp in wake_phrases)
             is_final = bool(event.get("is_final"))
             event_source = event.get("source") or asr_source or "deepgram"
             if (
@@ -1461,6 +1785,7 @@ def voice_worker(loop):
                 and event_source == "deepgram"
                 and confidence is not None
                 and confidence < SETTINGS.asr_min_conf
+                and not wake_match
             ):
                 app.state.session["debug"] = (
                     f"Deepgram confidence {confidence:.2f} below ASR_MIN_CONF {SETTINGS.asr_min_conf:.2f}"
@@ -1470,6 +1795,39 @@ def voice_worker(loop):
             _record_transcript(transcript, is_final, now)
             in_cooldown_now = time.time() < cooldown_until
 
+            # Echo suppression: if ASR hears our own currently playing TTS phrase,
+            # ignore it to prevent self-trigger loops (command -> TTS -> ASR -> command).
+            if app.state.tts_playing:
+                current_tts_norm = norm_join(str(getattr(app.state, "last_tts_text", "") or ""))
+                if (
+                    current_tts_norm
+                    and normalized
+                    and (
+                        current_tts_norm in normalized
+                        or normalized in current_tts_norm
+                    )
+                ):
+                    app.state.session["debug"] = "Ignoring transcript matched to active TTS"
+                    _emit_state()
+                    continue
+
+            # Barge-in: if user starts speaking while wake response TTS is still playing,
+            # stop TTS and keep processing the command instead of ignoring it.
+            if (
+                enable_barge_in
+                and app.state.tts_playing
+                and (wake_active or always_listening)
+                and not _stop_intent(transcript)
+            ):
+                tts_stop_event.set()
+                app.state.session["debug"] = "Barge-in: stopping TTS to capture command"
+                _emit_state()
+
+            if app.state.tts_playing and _stop_intent(transcript):
+                tts_stop_event.set()
+                app.state.session["debug"] = "TTS interrupted by stop command"
+                _emit_state()
+                continue
             if in_cooldown_now and _stop_intent(transcript):
                 tts_stop_event.set()
                 cooldown_until = 0.0
@@ -1478,24 +1836,60 @@ def voice_worker(loop):
                 app.state.session["debug"] = ""
                 set_mode("SLEEPING", time.time())
                 continue
+            # Allow explicit wake phrase to re-wake even during cooldown/TTS while idle.
+            if (
+                wake_match
+                and not wake_active
+                and not always_listening
+            ):
+                if app.state.tts_playing:
+                    tts_stop_event.set()
+                cooldown_until = 0.0
+                app.state.cooldown_until = 0.0
+                app.state.session["debug"] = ""
+                _trigger_wake(now)
+                continue
+            # Allow re-wake during cooldown once TTS is no longer playing.
+            if (
+                in_cooldown_now
+                and not app.state.tts_playing
+                and not wake_active
+                and not always_listening
+                and wake_match
+            ):
+                cooldown_until = 0.0
+                app.state.cooldown_until = 0.0
+                app.state.session["debug"] = ""
+                _trigger_wake(now)
+                continue
+            # If we are already in a follow-up listening session, don't keep blocking
+            # commands just because cooldown is still ticking.
+            if in_cooldown_now and wake_active and not app.state.tts_playing:
+                cooldown_until = 0.0
+                app.state.cooldown_until = 0.0
+                in_cooldown_now = False
+            if (
+                (app.state.tts_playing and not wake_active and not always_listening)
+                or (in_cooldown_now and not wake_active and not always_listening)
+            ) and not _stop_intent(transcript):
+                app.state.session["debug"] = "Ignoring transcript during TTS/cooldown"
+                _emit_state()
+                continue
 
             if not wake_active and not always_listening:
-                if not detector.available:
-                    wake_phrase = norm_join(SETTINGS.wake_phrase or "")
-                    wake_word = norm_join(SETTINGS.wake_word or "")
-                    wake_match = (
-                        (wake_phrase and wake_phrase in normalized)
-                        or (wake_word and wake_word in normalized)
-                    )
-                    if wake_match:
-                        if now - fallback_window_start > SETTINGS.fallback_hit_window_sec:
-                            fallback_window_start = now
-                            fallback_hits = 0
-                        fallback_hits += 1
-                        if fallback_hits >= SETTINGS.fallback_required_hits:
-                            _trigger_wake(now)
-                    else:
+                if wake_match:
+                    if now - fallback_window_start > SETTINGS.fallback_hit_window_sec:
+                        fallback_window_start = now
                         fallback_hits = 0
+                    fallback_hits += 1
+                    full_phrase_hit = any((" " in wp) and (wp in normalized) for wp in wake_phrases)
+                    required_hits = 1 if full_phrase_hit else max(
+                        1, int(SETTINGS.fallback_required_hits)
+                    )
+                    if fallback_hits >= required_hits:
+                        _trigger_wake(now)
+                else:
+                    fallback_hits = 0
                 continue
 
             if is_final:
@@ -1510,7 +1904,7 @@ def voice_worker(loop):
                 cmd_asr_source = event_source
                 dg_partial_text = transcript
 
-        if detector.available and not wake_active and not in_cooldown and not always_listening:
+        if detector.available and not wake_active and not always_listening and not app.state.tts_playing:
             oww_score = detector.score(audio_f32n)
             app.state.session["oww_score"] = oww_score
             app.state.session["oww_threshold"] = float(getattr(detector, "threshold", 0.0) or 0.0)
@@ -1636,6 +2030,10 @@ def voice_worker(loop):
         app.state.voice_ok = False
         if deepgram is not None:
             deepgram.close()
+        try:
+            detector.close()
+        except Exception:
+            pass
 
 
 async def broadcaster():
@@ -1853,6 +2251,12 @@ async def models_check():
     piper_exe_exists = shutil.which(SETTINGS.piper_path) is not None or _Path(SETTINGS.piper_path).is_file()
     oww_requested = (SETTINGS.wakeword_model_path or "").strip()
     oww_path, oww_name = resolve_openwakeword_model_path(oww_requested)
+    selected_wake_model = (oww_path or oww_requested or "").strip().lower()
+    wake_model_label = (
+        f"Microsoft Keyword Model (.table){f' ({oww_name})' if oww_name else ''}"
+        if selected_wake_model.endswith(".table")
+        else f"OpenWakeWord Model (.tflite){f' ({oww_name})' if oww_name else ''}"
+    )
     if not oww_path and oww_requested:
         # Configured but couldn't resolve to an existing file.
         # Surface the requested value so the UI doesn't misleadingly show "not configured".
@@ -1885,7 +2289,7 @@ async def models_check():
             },
             "openwakeword_model": {
                 **oww_check,
-                "label": f"OpenWakeWord Model (.tflite){f' ({oww_name})' if oww_name else ''}",
+                "label": wake_model_label,
                 "name": oww_name,
             },
         },
@@ -1894,12 +2298,14 @@ async def models_check():
             "vosk":                  {"installed": _check_pkg("vosk"),                "label": "vosk"},
             "noisereduce":           {"installed": _check_pkg("noisereduce"),         "label": "noisereduce"},
             "openwakeword":          {"installed": _check_pkg("openwakeword"),        "label": "openwakeword"},
+            "azure_speech_sdk":      {"installed": _check_pkg("azure.cognitiveservices.speech"), "label": "azure-cognitiveservices-speech"},
             "sounddevice":           {"installed": _check_pkg("sounddevice"),         "label": "sounddevice"},
             "python_dotenv":         {"installed": _check_pkg("dotenv"),              "label": "python-dotenv"},
             "sentence_transformers": {"installed": _check_pkg("sentence_transformers"), "label": "sentence-transformers"},
         },
         "settings": {
             "tts_enabled":       SETTINGS.tts_enabled,
+            "tts_backend":       SETTINGS.tts_backend,
             "duck_enabled":      SETTINGS.duck_enabled,
             "noise_reduction":   SETTINGS.noise_reduction_enabled,
             "noise_gate_auto":   SETTINGS.noise_gate_auto,

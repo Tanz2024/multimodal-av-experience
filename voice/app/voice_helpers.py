@@ -8,7 +8,7 @@ import time
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 DEFAULT_INTENT_CONFIG_PATH = str(Path(__file__).resolve().parents[1] / "config" / "intent_phrases.json")
 logger = logging.getLogger("voice-wake-sherpa")
@@ -16,10 +16,11 @@ logger = logging.getLogger("voice-wake-sherpa")
 
 @dataclass
 class Settings:
-    wake_word: str = os.getenv("WAKE_WORD", "jarvis")
-    wake_phrase: str = os.getenv("WAKE_PHRASE", "hey jarvis")
+    wake_word: str = os.getenv("WAKE_WORD", "tom")
+    wake_phrase: str = os.getenv("WAKE_PHRASE", "hey tom")
     sample_rate: int = 16000
-    block_size: int = 2048
+    # Smaller blocks reduce wake/ASR latency at the cost of slightly more CPU.
+    block_size: int = int(os.getenv("BLOCK_SIZE", "1024"))
     wake_window_sec: float = 6.0
     max_listen_sec: float = 12.0
     cooldown_sec: float = 1.5
@@ -44,6 +45,10 @@ class Settings:
     asr_min_conf: float = float(os.getenv("ASR_MIN_CONF", "0.55"))
     tts_enabled: bool = os.getenv("TTS_ENABLED", "false").lower() == "true"
     tts_backend: str = os.getenv("TTS_BACKEND", "piper").lower()
+    azure_tts_key_1: str = os.getenv("AZURE_TTS_KEY_1", os.getenv("SPEECH_KEY", ""))
+    azure_tts_key_2: str = os.getenv("AZURE_TTS_KEY_2", "")
+    speech_region: str = os.getenv("SPEECH_REGION", "")
+    azure_tts_voice: str = os.getenv("AZURE_TTS_VOICE", "ms-MY-YasminNeural")
     piper_path: str = os.getenv("PIPER_PATH", "piper")
     piper_model_path: str = os.getenv("PIPER_MODEL_PATH", "")
     piper_speaker: str = os.getenv("PIPER_SPEAKER", "")
@@ -199,29 +204,98 @@ def match_intent_keywords(text: str) -> str | None:
     if not tokens:
         return None
 
+    if {"help", "command", "commands", "assist", "assistance", "support", "guide"} & tokens:
+        return "help"
+
+    # Option-name keyword routing (checked before broad experience keywords).
+    if {"soft", "gentle"} & tokens and {"welcome", "greeting", "arrival"} & tokens:
+        return "opt_soft_welcome"
+    if {"luxury", "premium"} & tokens and {"ambient", "welcome", "arrival"} & tokens:
+        return "opt_luxury_ambient"
+    if {"background"} & tokens and {"ambience", "ambient"} & tokens:
+        return "opt_background_ambience"
+    if {"entertaining", "hosting", "host", "party"} & tokens and {"mode", "option", "setting"} & tokens:
+        return "opt_entertaining_mode"
+    if {"invisible"} & tokens and {"cinema", "movie", "theater", "theatre"} & tokens:
+        return "opt_invisible_cinema"
+    if {"live", "concert"} & tokens and {"performance", "cinema", "movie", "mode"} & tokens:
+        return "opt_live_performance"
+    if {"luxury", "apartment"} & tokens and {"night", "evening"} & tokens:
+        return "opt_luxury_apartment_night"
+    if {"background"} & tokens and {"lounge"} & tokens:
+        return "opt_background_lounge"
+    if {"cocktail"} & tokens and {"evening", "night", "mode"} & tokens:
+        return "opt_cocktail_evening"
+    if {"design", "focus"} & tokens:
+        return "opt_design_focus"
+    if {"silent"} & tokens and {"design", "focus"} & tokens:
+        return "opt_design_focus"
+
     if "welcome" in tokens or ("well" in tokens and "come" in tokens):
         return "welcome"
-    if "kitchen" in tokens:
+    if "kitchen" in tokens or {"cook", "cooking", "culinary"} & tokens:
         return "kitchen"
-    if "invisible" in tokens:
+    if "invisible" in tokens or {"hidden", "stealth", "discreet"} & tokens:
         return "invisible"
-    if "cinema" in tokens:
+    if "cinema" in tokens or {"movie", "movies", "theater", "theatre", "film"} & tokens:
         return "cinema"
-    if "lounge" in tokens:
+    if "lounge" in tokens or {"party", "entertainment", "social", "relax", "chill"} & tokens:
         return "lounge"
-    if "iconic" in tokens:
+    if "iconic" in tokens or {"signature", "statement"} & tokens:
+        return "iconic"
+
+    if (
+        ("design" in tokens and ("mode" in tokens or "experience" in tokens))
+        or ("iconic" in tokens and "design" in tokens)
+    ):
         return "iconic"
 
     if {"mute", "silence"} & tokens:
         return "mute"
+    if {"stop"} & tokens and {"music", "audio", "sound"} & tokens:
+        return "all_sound_off"
     if ("emergency" in tokens or "panic" in tokens) and ({"off", "mute", "stop"} & tokens):
         return "all_sound_off"
-    if {"next"} & tokens:
+    if {"next", "forward", "continue"} & tokens:
         return "next"
-    if {"previous", "prev"} & tokens:
+    if {"previous", "prev", "prior", "backward", "backwards"} & tokens:
         return "previous"
-    if {"back"} & tokens:
+    if {"back", "home"} & tokens:
         return "back"
+    if {"close", "dismiss", "exit"} & tokens and {"panel", "modal", "screen", "experience", "this", "that"} & tokens:
+        return "back"
+
+    number_map = {
+        "1": 1,
+        "one": 1,
+        "first": 1,
+        "2": 2,
+        "two": 2,
+        "second": 2,
+        "3": 3,
+        "three": 3,
+        "third": 3,
+        "4": 4,
+        "four": 4,
+        "fourth": 4,
+        "5": 5,
+        "five": 5,
+        "fifth": 5,
+        "6": 6,
+        "six": 6,
+        "sixth": 6,
+        "7": 7,
+        "seven": 7,
+        "seventh": 7,
+    }
+    selected_num = next((val for key, val in number_map.items() if key in tokens), None)
+    if selected_num is not None:
+        if {"option", "select", "choose", "pick", "number"} & tokens:
+            return f"option_{selected_num}"
+        if {"open", "show", "launch", "start"} & tokens and {"experience", "screen", "panel", "mode"} & tokens:
+            return f"open_{selected_num}"
+        if "open" in tokens or "show" in tokens:
+            return f"open_{selected_num}"
 
     # Handle generic showroom requests like "open experience" / "show experiences".
     # These are ambiguous without a target, so route to help instead of unknown.
@@ -269,7 +343,7 @@ def match_intent_keywords(text: str) -> str | None:
 DEFAULT_INTENT_PHRASES = {
     "greet": ["hello", "hi", "hey", "are you there", "can you hear me"],
     "help": ["help", "what can you do", "what can i say", "commands", "show commands", "options", "list options"],
-    "bye": ["bye", "goodbye", "thanks", "thank you", "thanks for using jarvis", "see you"],
+    "bye": ["bye", "goodbye", "thanks", "thank you", "thanks for using tom", "see you"],
     "back": ["back", "go back", "close", "close this", "close that", "exit", "dismiss", "close the panel", "go back please"],
     "cancel": ["cancel", "never mind", "stop listening", "stop listening now", "cancel listening"],
     "next": ["next", "next option", "next one", "move next"],
@@ -303,7 +377,7 @@ DEFAULT_INTENT_PHRASES = {
 DEFAULT_INTENT_RESPONSES = {
     "greet": "How may I help you?",
     "help": "You can say Welcome, Kitchen, Invisible, Cinema, Lounge, Iconic, All Sound Off, Volume up, Volume down, Next, Previous, or Back.",
-    "bye": "Bye, thanks for using Jarvis.",
+    "bye": "Bye, thanks for using Tom.",
     "back": "Back.",
     "cancel": "Okay, I will stop listening.",
     "next": "Next.",
@@ -544,6 +618,9 @@ class AudioDucker:
         self._prev_scalar = None
         self._prev_pactl_volume = None
         self.settings = settings
+        # Small fade window to avoid abrupt duck/unduck pops.
+        self._ramp_ms = 200
+        self._ramp_steps = 8
 
     def _read_pactl_percent(self) -> str | None:
         try:
@@ -576,6 +653,21 @@ class AudioDucker:
         else:
             self._backend = "pactl"
 
+    def _ramp_pycaw(self, start: float, end: float):
+        if not self._volume:
+            return
+        steps = max(1, int(self._ramp_steps))
+        delay = max(0.0, float(self._ramp_ms) / 1000.0 / steps)
+        for i in range(1, steps + 1):
+            try:
+                t = i / steps
+                value = start + (end - start) * t
+                self._volume.SetMasterVolumeLevelScalar(max(0.0, min(1.0, value)), None)
+            except Exception:
+                break
+            if delay > 0:
+                time.sleep(delay)
+
     def duck(self):
         if not self.settings.duck_enabled:
             return
@@ -586,7 +678,7 @@ class AudioDucker:
                 current = self._volume.GetMasterVolumeLevelScalar()
                 self._prev_scalar = current
                 target = max(0.0, min(1.0, current * self.settings.duck_ratio))
-                self._volume.SetMasterVolumeLevelScalar(target, None)
+                self._ramp_pycaw(float(current), float(target))
             except Exception:
                 return
         elif self._backend == "pactl":
@@ -612,7 +704,8 @@ class AudioDucker:
         if self._backend == "pycaw" and self._volume:
             try:
                 restore = 1.0 if self._prev_scalar is None else self._prev_scalar
-                self._volume.SetMasterVolumeLevelScalar(restore, None)
+                current = self._volume.GetMasterVolumeLevelScalar()
+                self._ramp_pycaw(float(current), float(restore))
             except Exception:
                 return
         elif self._backend == "pactl":
@@ -926,6 +1019,11 @@ class OpenWakeWordDetector:
         resolved_path, resolved_name = resolve_openwakeword_model_path(model_path)
         if not resolved_path:
             return
+        # Microsoft keyword models use `.table` and are not loadable by openwakeword.
+        if str(resolved_path).lower().endswith(".table"):
+            self.model_path = resolved_path
+            self.model_name = resolved_name or os.path.splitext(os.path.basename(resolved_path))[0]
+            return
         try:
             from openwakeword.model import Model
             self.model = Model(wakeword_models=[resolved_path])
@@ -973,6 +1071,121 @@ class OpenWakeWordDetector:
 
     def detect(self, audio) -> bool:
         return self.score(audio) >= self.threshold
+
+
+class MicrosoftKeywordDetector:
+    """
+    Microsoft Speech SDK keyword spotter for custom `.table` models.
+
+    This detector streams PCM frames into a PushAudioInputStream and flips an
+    internal trigger flag when SDK emits a recognized keyword event.
+    """
+
+    def __init__(self, model_path: str):
+        self.available = False
+        self.model_name = None
+        self.model_path = ""
+        self.threshold = 1.0
+        self.last_error = ""
+        self._speechsdk = None
+        self._push_stream = None
+        self._recognizer = None
+        self._keyword_model = None
+        self._triggered = Event()
+        self._lock = Lock()
+
+        resolved_path, resolved_name = resolve_openwakeword_model_path(model_path)
+        if not resolved_path or not str(resolved_path).lower().endswith(".table"):
+            return
+
+        try:
+            import azure.cognitiveservices.speech as speechsdk
+
+            stream_format = speechsdk.audio.AudioStreamFormat(
+                samples_per_second=16000,
+                bits_per_sample=16,
+                channels=1,
+            )
+            push_stream = speechsdk.audio.PushAudioInputStream(stream_format=stream_format)
+            audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
+            recognizer = speechsdk.KeywordRecognizer(audio_config=audio_config)
+            keyword_model = speechsdk.KeywordRecognitionModel(resolved_path)
+
+            def _on_recognized(evt):
+                try:
+                    reason = getattr(getattr(evt, "result", None), "reason", None)
+                    rr = getattr(speechsdk, "ResultReason", None)
+                    if rr is None or reason == rr.RecognizedKeyword:
+                        self._triggered.set()
+                except Exception:
+                    self._triggered.set()
+
+            def _on_canceled(evt):
+                try:
+                    self.last_error = str(getattr(evt, "reason", "keyword canceled"))
+                except Exception:
+                    self.last_error = "keyword canceled"
+
+            recognizer.recognized.connect(_on_recognized)
+            recognizer.canceled.connect(_on_canceled)
+            recognizer.start_keyword_recognition_async(keyword_model).get()
+
+            self._speechsdk = speechsdk
+            self._push_stream = push_stream
+            self._recognizer = recognizer
+            self._keyword_model = keyword_model
+            self.model_path = resolved_path
+            self.model_name = resolved_name or os.path.splitext(os.path.basename(resolved_path))[0]
+            self.available = True
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.available = False
+
+    def _to_pcm16_bytes(self, audio) -> bytes:
+        import numpy as np
+
+        if isinstance(audio, (bytes, bytearray)):
+            return bytes(audio)
+        x = np.asarray(audio)
+        if x.dtype == np.int16:
+            return x.tobytes()
+        if np.issubdtype(x.dtype, np.floating):
+            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            x = np.clip(x, -1.0, 1.0)
+            return (x * 32767.0).astype(np.int16).tobytes()
+        x = np.clip(x, -32768, 32767).astype(np.int16)
+        return x.tobytes()
+
+    def score(self, audio) -> float:
+        if not self.available:
+            return 0.0
+        try:
+            pcm = self._to_pcm16_bytes(audio)
+            if pcm:
+                with self._lock:
+                    self._push_stream.write(pcm)
+            if self._triggered.is_set():
+                self._triggered.clear()
+                return 1.0
+            return 0.0
+        except Exception as exc:
+            self.last_error = str(exc)
+            return 0.0
+
+    def detect(self, audio) -> bool:
+        return self.score(audio) >= self.threshold
+
+    def close(self):
+        try:
+            if self._recognizer is not None:
+                self._recognizer.stop_keyword_recognition_async().get()
+        except Exception:
+            pass
+        try:
+            if self._push_stream is not None:
+                self._push_stream.close()
+        except Exception:
+            pass
 
 
 class NoiseReducer:

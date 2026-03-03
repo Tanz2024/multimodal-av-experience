@@ -9,7 +9,7 @@
   "phrases": {
     "greet": ["hello", "hi", "hey", "are you there", "can you hear me"],
     "help": ["help", "what can you do", "what can i say", "commands", "show commands", "options", "list options"],
-    "bye": ["bye", "goodbye", "thanks", "thank you", "thanks for using jarvis", "see you"],
+    "bye": ["bye", "goodbye", "thanks", "thank you", "thanks for using tom", "see you"],
     "back": ["back", "go back", "close", "close this", "close that", "exit", "dismiss", "close the panel", "go back please"],
     "cancel": ["cancel", "never mind", "stop listening", "stop listening now", "cancel listening"],
     "next": ["next", "next option", "next one", "move next"],
@@ -96,7 +96,7 @@
   "responses": {
     "greet": "How may I help you?",
     "help": "You can say Welcome, Kitchen, Invisible, Cinema, Lounge, Iconic, All Sound Off, Volume up, Volume down, Next, Previous, or Back.",
-    "bye": "Goodbye! Thanks for using Jarvis. Have a great day!",
+    "bye": "Goodbye! Thanks for using Tom. Have a great day!",
     "back": "Going back to the main menu.",
     "cancel": "Okay, I will stop listening.",
     "next": "Moving to the next option.",
@@ -139,3 +139,5 @@
     "unknown": "Sorry, I don't get what you mean."
   }
 }
+
+

@@ -22,6 +22,16 @@
       "show commands",
       "options",
       "list options",
+      "what should i say",
+      "what can i ask",
+      "how do i use this",
+      "how to use this",
+      "show help",
+      "assist me",
+      "i need help",
+      "help me",
+      "guide me",
+      "show menu",
       "the art of sound",
       "audio experience suite",
       "command center",
@@ -32,7 +42,7 @@
       "goodbye",
       "thanks",
       "thank you",
-      "thanks for using jarvis",
+      "thanks for using tom",
       "see you"
     ],
     "back": [
@@ -252,7 +262,11 @@
       "choose option one",
       "pick option one",
       "first option",
-      "number one option"
+      "number one option",
+      "first one",
+      "select first",
+      "first setting",
+      "first preset"
     ],
     "option_2": [
       "option two",
@@ -261,7 +275,11 @@
       "choose option two",
       "pick option two",
       "second option",
-      "number two option"
+      "number two option",
+      "second one",
+      "select second",
+      "second setting",
+      "second preset"
     ],
     "option_3": [
       "option three",
@@ -271,34 +289,54 @@
       "pick option three",
       "silent design focus",
       "third option",
-      "number three option"
+      "number three option",
+      "third one",
+      "select third",
+      "third setting",
+      "third preset"
     ],
     "opt_soft_welcome": [
       "soft welcome",
       "soft welcome volume",
       "soft mode",
-      "soft preset"
+      "soft preset",
+      "gentle welcome",
+      "warm welcome",
+      "welcome soft",
+      "soft greeting"
     ],
     "opt_luxury_ambient": [
       "luxury ambient",
       "luxury welcome",
       "luxury ambient volume",
       "luxury mode",
-      "luxury preset"
+      "luxury preset",
+      "premium ambient",
+      "ambient luxury",
+      "premium welcome",
+      "rich ambient"
     ],
     "opt_background_ambience": [
       "background ambience",
       "background ambience volume",
       "background ambience mode",
       "ambience mode",
-      "ambient background"
+      "ambient background",
+      "background ambient",
+      "ambient mode",
+      "subtle ambience",
+      "soft ambience"
     ],
     "opt_entertaining_mode": [
       "entertaining mode",
       "entertaining mode volume",
       "entertaining",
       "hosting mode",
-      "entertainment mode"
+      "entertainment mode",
+      "party mode",
+      "hosting preset",
+      "guest mode",
+      "social mode"
     ],
     "opt_silent": [
       "silent",
@@ -307,65 +345,96 @@
     "opt_invisible_cinema": [
       "invisible cinema",
       "quiet cinema",
-      "hidden cinema"
+      "hidden cinema",
+      "stealth cinema",
+      "discreet cinema",
+      "silent cinema"
     ],
     "opt_live_performance": [
       "live performance",
       "concert mode",
-      "live mode"
+      "live mode",
+      "concert performance",
+      "stage mode",
+      "performance mode"
     ],
     "opt_luxury_apartment_night": [
       "luxury apartment night",
       "night mode",
-      "apartment night mode"
+      "apartment night mode",
+      "luxury night",
+      "night preset",
+      "cinema night mode"
     ],
     "opt_background_lounge": [
       "background lounge",
       "background lounge volume",
       "background lounge mode",
-      "lounge mode"
+      "lounge mode",
+      "lounge background",
+      "relax lounge",
+      "chill lounge"
     ],
     "opt_cocktail_evening": [
       "cocktail evening",
       "cocktail evening volume",
       "cocktail",
       "cocktail mode",
-      "evening mode"
+      "evening mode",
+      "cocktail night",
+      "evening cocktail",
+      "party evening"
     ],
     "opt_design_focus": [
       "design focus",
       "silent design focus",
       "design focus volume",
       "design mode focus",
-      "focus mode"
+      "focus mode",
+      "design mode",
+      "focused listening",
+      "quiet design",
+      "silent focus"
     ],
     "option_4": [
       "option four",
       "option 4",
       "select option four",
       "choose option four",
-      "pick option four"
+      "pick option four",
+      "fourth option",
+      "select fourth",
+      "fourth setting"
     ],
     "option_5": [
       "option five",
       "option 5",
       "select option five",
       "choose option five",
-      "pick option five"
+      "pick option five",
+      "fifth option",
+      "select fifth",
+      "fifth setting"
     ],
     "option_6": [
       "option six",
       "option 6",
       "select option six",
       "choose option six",
-      "pick option six"
+      "pick option six",
+      "sixth option",
+      "select sixth",
+      "sixth setting"
     ],
     "option_7": [
       "option seven",
       "option 7",
       "select option seven",
       "choose option seven",
-      "pick option seven"
+      "pick option seven",
+      "seventh option",
+      "select seventh",
+      "seventh setting"
     ],
     "volume_up": [
       "volume up",
@@ -434,7 +503,7 @@
   "responses": {
     "greet": "How may I help you?",
     "help": "You can say Welcome, Kitchen, Invisible, Cinema, Lounge, Iconic, All Sound Off, Volume up, Volume down, Next, Previous, or Back.",
-    "bye": "Goodbye! Thanks for using Jarvis. Have a great day!",
+    "bye": "Goodbye! Thanks for using Tom. Have a great day!",
     "back": "Going back to the main menu.",
     "cancel": "Okay, I will stop listening.",
     "next": "Moving to the next option.",
@@ -474,6 +543,8 @@
     "option_7": "Selecting option seven.",
     "volume_up": "Increasing volume.",
     "volume_down": "Decreasing volume.",
-    "unknown": "Sorry, I don't get what you mean."
+    "unknown": "I didn't understand that. Please try a command like open cinema, option two, volume up, or help."
   }
 }
+
+
