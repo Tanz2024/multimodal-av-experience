@@ -14,12 +14,13 @@ from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 
 try:
     from dotenv import load_dotenv as _load_dotenv
-    _override = os.getenv("DOTENV_OVERRIDE", "true").lower() == "true"
-    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=_override)
+    # Always load project .env as source of truth for runtime audio config.
+    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
 except ImportError:
     pass  # python-dotenv not installed; env vars must be set before launch
 
@@ -72,6 +73,7 @@ COMMAND_RATE_LIMIT_SEC = float(os.getenv("COMMAND_RATE_LIMIT_SEC", "0.35"))
 COMMAND_DEBOUNCE_SEC = float(os.getenv("COMMAND_DEBOUNCE_SEC", "1.0"))
 COMMAND_TEXT_DEBOUNCE_SEC = float(os.getenv("COMMAND_TEXT_DEBOUNCE_SEC", "2.0"))
 COMMAND_QUEUE_MAX = int(os.getenv("COMMAND_QUEUE_MAX", "100"))
+_audio_queue_max = max(20, int(os.getenv("AUDIO_QUEUE_MAX", "400")))
 COMMAND_TIMEOUT_SEC = float(os.getenv("COMMAND_TIMEOUT_SEC", "0.8"))
 COMMAND_MAX_RETRIES = int(os.getenv("COMMAND_MAX_RETRIES", "2"))
 COMMAND_LOG_MAX = int(os.getenv("COMMAND_LOG_MAX", "200"))
@@ -89,7 +91,7 @@ logger = logging.getLogger("voice-wake-sherpa")
 clients = set()
 event_queue = queue.Queue()
 tts_queue = queue.Queue()
-audio_queue = queue.Queue(maxsize=100)
+audio_queue = queue.Queue(maxsize=_audio_queue_max)
 command_queue = queue.Queue(maxsize=COMMAND_QUEUE_MAX)
 stop_event = Event()
 tts_stop_event = Event()
@@ -188,6 +190,21 @@ def _emit(payload):
     event_queue.put(_json_sanitize(payload))
 
 
+def _status_payload():
+    return _json_sanitize(
+        {
+            "ok": True,
+            "voice_ok": app.state.voice_ok,
+            "session": dict(app.state.session),
+            "metrics": dict(app.state.metrics),
+            "command_queue_depth": command_queue.qsize(),
+            "voice_preset": dict(VOICE_PRESET),
+            "clients": len(clients),
+            "timestamp": round(time.time(), 3),
+        }
+    )
+
+
 def _json_sanitize(obj):
     """
     Starlette uses strict JSON rendering (no NaN/Inf). Sanitize any non-finite
@@ -215,9 +232,12 @@ def _json_sanitize(obj):
 
 def _emit_state():
     _emit(
-        _json_sanitize(
-            {"type": "state_update", "source": "voice", "state": dict(app.state.session)}
-        )
+        {
+            "type": "state_update",
+            "source": "voice",
+            "state": dict(app.state.session),
+            "status": _status_payload(),
+        }
     )
 
 
@@ -260,6 +280,7 @@ def _log_command_event(event: str, **kwargs):
     _append_command_log(_json_sanitize(payload))
     app.state.session["last_action"] = payload
     logger.info("command_event=%s data=%s", event, {k: v for k, v in kwargs.items()})
+    _emit({"type": "command_event", "source": "voice", "payload": payload})
 
 
 def _confirm_yes(text: str) -> bool:
@@ -345,7 +366,7 @@ def _wake_token_aliases(token: str) -> list[str]:
     aliases = {t}
     # Tolerate common ASR variants for the same wake pronunciation.
     if t in {"tom", "thom"}:
-        aliases.update({"tom", "thom"})
+        aliases.update({"tom", "thom", "dom", "tam"})
     return [a for a in aliases if a]
 
 
@@ -379,6 +400,82 @@ def _wake_phrase_variants() -> list[str]:
 
     # Deterministic ordering: prefer longer phrases first.
     return sorted(variants, key=lambda p: len(p.split()), reverse=True)
+
+
+def _wake_token_match(a: str, b: str) -> bool:
+    a = norm_join(a)
+    b = norm_join(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Compare across known aliases first (e.g. tom/thom/dom).
+    a_alias = set(_wake_token_aliases(a))
+    b_alias = set(_wake_token_aliases(b))
+    if a_alias & b_alias:
+        return True
+    # Allow a single small edit for ASR drift.
+    if abs(len(a) - len(b)) > 1:
+        return False
+    i = 0
+    j = 0
+    edits = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(a) == len(b):
+            i += 1
+            j += 1
+        elif len(a) > len(b):
+            i += 1
+        else:
+            j += 1
+    if i < len(a) or j < len(b):
+        edits += 1
+    return edits <= 1
+
+
+def _wake_phrase_match(text: str, wake_phrases: list[str]) -> bool:
+    normalized = norm_join(text)
+    if not normalized:
+        return False
+    if any(wp and wp in normalized for wp in wake_phrases):
+        return True
+
+    tokens = normalized.split()
+    for phrase in wake_phrases:
+        ptoks = [t for t in norm_join(phrase).split() if t]
+        if not ptoks or len(ptoks) > len(tokens):
+            continue
+        w = len(ptoks)
+        for start in range(0, len(tokens) - w + 1):
+            if all(_wake_token_match(tokens[start + i], ptoks[i]) for i in range(w)):
+                return True
+    return False
+
+
+def _soft_wake_greeting_match(text: str) -> bool:
+    """
+    Fallback for low-quality headset transcripts where wake phrase may be
+    misheard as a short greeting like "huh"/"hey"/"hi".
+    """
+    allowed = {
+        tok
+        for tok in normalize_tokens(os.getenv("WAKE_GREETING_FALLBACK", "hey hi hello huh"))
+        if tok
+    }
+    toks = normalize_tokens(text or "")
+    if not toks or not allowed:
+        return False
+    # Keep this conservative: only very short utterances can soft-wake.
+    if len(toks) > 2:
+        return False
+    return any(t in allowed for t in toks)
 
 
 def _load_intent_bundle(path: str):
@@ -1095,7 +1192,11 @@ def voice_worker(loop):
         logger.error("Missing deps for voice: %s", exc)
         return
 
-    def _select_loudest_channel_int16(data: bytes, channels: int) -> tuple[bytes, int, list[float]]:
+    def _select_loudest_channel_int16(
+        data: bytes,
+        channels: int,
+        channel_lock: int = -1,
+    ) -> tuple[bytes, int, list[float]]:
         """
         sounddevice RawInputStream returns interleaved int16 PCM when channels > 1.
         Some USB mics expose multiple channels where one may be silent; pick the
@@ -1111,7 +1212,10 @@ def voice_worker(loop):
                 return data, 0, []
             x = x[: frames * ch].reshape(frames, ch).astype(np.float32)
             rms_by_ch = np.sqrt(np.mean((x / 32768.0) ** 2, axis=0)).astype(float).tolist()
-            best = int(np.argmax(np.asarray(rms_by_ch, dtype=np.float32)))
+            if 0 <= int(channel_lock) < ch:
+                best = int(channel_lock)
+            else:
+                best = int(np.argmax(np.asarray(rms_by_ch, dtype=np.float32)))
             mono = x[:, best].astype(np.int16).tobytes()
             return mono, best, [float(r) for r in rms_by_ch]
         except Exception:
@@ -1136,22 +1240,87 @@ def voice_worker(loop):
         except Exception:
             return audio_f32
 
-    resolved_wake_model_path, _ = resolve_openwakeword_model_path(SETTINGS.wakeword_model_path)
-    using_microsoft_keyword = str(resolved_wake_model_path).lower().endswith(".table")
-    if using_microsoft_keyword:
-        detector = MicrosoftKeywordDetector(SETTINGS.wakeword_model_path)
-        if detector.available:
-            logger.info("Microsoft keyword model loaded: %s", SETTINGS.wakeword_model_path)
-        else:
-            err = getattr(detector, "last_error", "") or "unknown error"
-            logger.warning("Microsoft keyword model unavailable (%s). Fallback to Deepgram wake phrase.", err)
-    else:
-        detector = OpenWakeWordDetector(
-            SETTINGS.wakeword_model_path,
-            threshold=SETTINGS.wakeword_threshold,
+    def _is_device_invalidated_error(exc: Exception) -> bool:
+        txt = str(exc or "").lower()
+        return (
+            "audclnt_e_device_invalidated" in txt
+            or "wasapi error -2004287484" in txt
+            or ("device" in txt and "invalidated" in txt)
         )
+
+    def _is_insufficient_memory_error(exc: Exception) -> bool:
+        txt = str(exc or "").lower()
+        return "insufficient memory" in txt or "paerrorcode -9992" in txt
+
+    def _is_blocking_api_unsupported_error(exc: Exception) -> bool:
+        txt = str(exc or "").lower()
+        return "blocking api not supported yet" in txt or "wdm-ks error" in txt
+
+    def _is_wdmks_device(device) -> bool:
+        try:
+            import sounddevice as _sd
+
+            idx = device
+            if idx is None:
+                default_dev = _sd.default.device[0] if hasattr(_sd.default, "device") else None
+                idx = default_dev
+            if idx is None:
+                return False
+            info = _sd.query_devices(idx)
+            hostapi_idx = int(info.get("hostapi") or 0)
+            hostapis = _sd.query_hostapis()
+            if 0 <= hostapi_idx < len(hostapis):
+                host_name = str(hostapis[hostapi_idx].get("name", "")).lower()
+                return "wdm-ks" in host_name
+        except Exception:
+            return False
+        return False
+
+    def _stream_open_candidates():
+        cfg_device = resolve_device(SETTINGS)
+        cfg_sr = resolve_sample_rate(SETTINGS, cfg_device)
+        cfg_ch = resolve_input_channels(SETTINGS, cfg_device)
+
+        raw = [
+            # User-selected device first.
+            (cfg_device, cfg_sr, cfg_ch, "configured"),
+            (cfg_device, int(getattr(SETTINGS, "sample_rate", 16000) or 16000), 1, "configured-16k-mono"),
+            # Fall back to default input device with conservative params.
+            (None, int(getattr(SETTINGS, "sample_rate", 16000) or 16000), 1, "default-16k-mono"),
+            (None, 48000, 1, "default-48k-mono"),
+            (None, 44100, 1, "default-44k-mono"),
+        ]
+        out = []
+        seen = set()
+        for dev, sr, ch, label in raw:
+            try:
+                sr = int(sr)
+                ch = int(ch)
+            except Exception:
+                continue
+            if sr <= 0 or ch <= 0:
+                continue
+            key = (str(dev), sr, ch)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((dev, sr, ch, label))
+        return out
+
+    model_path = (SETTINGS.wakeword_model_path or "").strip()
+    if model_path.lower().endswith(".table"):
+        detector = MicrosoftKeywordDetector(model_path)
         if detector.available:
-            logger.info("OpenWakeWord loaded: %s", SETTINGS.wakeword_model_path)
+            logger.info("Microsoft Keyword detector loaded: %s", model_path)
+        else:
+            logger.warning(
+                "Microsoft Keyword detector failed: %s — fallback to Deepgram.",
+                detector.last_error,
+            )
+    else:
+        detector = OpenWakeWordDetector(model_path, threshold=SETTINGS.wakeword_threshold)
+        if detector.available:
+            logger.info("OpenWakeWord loaded: %s", model_path)
         else:
             logger.warning("OpenWakeWord not available. Fallback to Deepgram wake phrase.")
 
@@ -1212,6 +1381,11 @@ def voice_worker(loop):
     wake_prompt_block_sec = float(os.getenv("WAKE_PROMPT_BLOCK_SEC", "1.2"))
     followup_listen_sec = float(os.getenv("FOLLOWUP_LISTEN_SEC", "12.0"))
     enable_barge_in = os.getenv("ENABLE_BARGE_IN", "true").lower() == "true"
+    wake_parallel_vosk = os.getenv("WAKE_PARALLEL_VOSK", "true").lower() == "true"
+    ms_wake_only_test = os.getenv("MS_WAKE_ONLY_TEST", "false").lower() == "true"
+    # Extra gain path for low-input microphones (e.g. Bluetooth headsets) while sleeping.
+    wake_target_rms = float(os.getenv("WAKE_TARGET_RMS", "0.08"))
+    wake_max_gain = float(os.getenv("WAKE_MAX_GAIN", "256.0"))
 
     def set_mode(new_mode: str, now: float):
         if app.state.mode == new_mode:
@@ -1424,6 +1598,12 @@ def voice_worker(loop):
         except Exception:
             app.state.session["voice_rms_norm"] = None
         data_norm = (audio_f32n * 32767.0).astype(np.int16).tobytes()
+        # Use raw input for wake boosting to avoid over-suppressing quiet speech.
+        wake_gain = wake_target_rms / max(rms_raw, 1e-6)
+        wake_gain = max(1.0, min(wake_max_gain, wake_gain))
+        audio_f32_wake = np.clip(audio_f32_in * wake_gain, -1.0, 1.0)
+        audio_f32_wake = _resample_f32(audio_f32_wake, input_sample_rate, target_sample_rate)
+        wake_data_norm = (audio_f32_wake * 32767.0).astype(np.int16).tobytes()
         pre_roll_buffer.append(data_norm)
 
         def reset_listening(to_idle: bool = True):
@@ -1440,6 +1620,7 @@ def voice_worker(loop):
         def finalize_command():
             nonlocal cooldown_until, wake_active, utterance_start, listen_until
             nonlocal executing_until
+            nonlocal last_non_command_prompt_ts
 
             if not always_listening and app.state.mode != "LISTENING":
                 return
@@ -1474,7 +1655,7 @@ def voice_worker(loop):
             if (
                 always_listening
                 and len(normalized_text.split()) <= 3
-                and any(wp and wp in normalized_text for wp in wake_phrases)
+                and _wake_phrase_match(normalized_text, wake_phrases)
             ):
                 app.state.session["last_intent"] = "greet"
                 app.state.session["last_response"] = SETTINGS.wake_response
@@ -1713,23 +1894,57 @@ def voice_worker(loop):
             always_listening
             or wake_active
             or in_cooldown
+            or SETTINGS.force_asr_wake_phrase
             or (not detector.available)
             or (rms_raw > (SETTINGS.noise_gate_rms * 0.7))
         )
+        # Diagnostic mode: while sleeping, rely only on Microsoft keyword detector.
+        # This helps verify whether the custom .table model itself is triggering.
+        if (
+            ms_wake_only_test
+            and detector.available
+            and not wake_active
+            and not always_listening
+            and not in_cooldown
+        ):
+            needs_asr_stream = False
         if needs_asr_stream:
+            # While sleeping, prefer wake-boosted frames so "hey tom" can be
+            # recognized on low-sensitivity microphones.
+            asr_frame = wake_data_norm if (not wake_active and not always_listening) else data_norm
+            deepgram_events: list[dict] = []
+            vosk_events: list[dict] = []
             if _ensure_deepgram(now):
-                deepgram.send_audio(data_norm)
-                events = deepgram.drain_events()
+                deepgram.send_audio(asr_frame)
+                deepgram_events = deepgram.drain_events()
                 asr_source = "deepgram"
             else:
                 if vosk_ready and vosk_stream is not None:
-                    events = vosk_stream.process_audio(data_norm)
+                    vosk_events = vosk_stream.process_audio(asr_frame)
                     asr_source = "vosk"
                     app.state.voice_ok = True
                     app.state.metrics["asr_fallback_to_vosk"] += 1
                 else:
-                    events = []
                     asr_source = "none"
+
+            # Wake-only safety net: keep a local Vosk stream running in parallel
+            # while sleeping so wake phrase detection doesn't depend on a single ASR.
+            if (
+                wake_parallel_vosk
+                and not wake_active
+                and not always_listening
+                and vosk_ready
+                and vosk_stream is not None
+            ):
+                extra = vosk_stream.process_audio(asr_frame)
+                if extra:
+                    vosk_events.extend(extra)
+
+            events = deepgram_events + vosk_events
+            if deepgram_events and vosk_events:
+                asr_source = "hybrid"
+            elif vosk_events and asr_source == "none":
+                asr_source = "vosk"
         else:
             if deepgram is not None and deepgram.connected:
                 try:
@@ -1777,7 +1992,19 @@ def voice_worker(loop):
                 continue
 
             normalized = norm_join(transcript)
-            wake_match = any(wp and wp in normalized for wp in wake_phrases)
+            wake_match = _wake_phrase_match(normalized, wake_phrases)
+            soft_wake_min_rms = float(os.getenv("WAKE_SOFT_MIN_RMS", "0.001"))
+            soft_wake = (
+                (not wake_match)
+                and (not wake_active)
+                and (not always_listening)
+                and bool(SETTINGS.force_asr_wake_phrase)
+                and (rms_raw >= soft_wake_min_rms)
+                and _soft_wake_greeting_match(transcript)
+            )
+            if soft_wake:
+                wake_match = True
+                app.state.session["debug"] = f"Soft wake fallback: {transcript!r}"
             is_final = bool(event.get("is_final"))
             event_source = event.get("source") or asr_source or "deepgram"
             if (
@@ -1904,12 +2131,15 @@ def voice_worker(loop):
                 cmd_asr_source = event_source
                 dg_partial_text = transcript
 
-        if detector.available and not wake_active and not always_listening and not app.state.tts_playing:
-            oww_score = detector.score(audio_f32n)
+        if detector.available and not wake_active and not in_cooldown and not always_listening:
+            oww_score = detector.score(audio_f32_wake, src_sample_rate=target_sample_rate)
             app.state.session["oww_score"] = oww_score
-            app.state.session["oww_threshold"] = float(getattr(detector, "threshold", 0.0) or 0.0)
+            app.state.session["oww_threshold"] = float(getattr(detector, "threshold", 1.0) or 1.0)
 
-            if oww_score >= float(getattr(detector, "threshold", 0.0) or 0.0):
+            # Microsoft detector returns 1.0 on trigger, OWW returns a float score
+            threshold = float(getattr(detector, "threshold", 1.0) or 1.0)
+            if oww_score >= threshold:
+                logger.info("Wake word detected! score=%.3f threshold=%.3f", oww_score, threshold)
                 _trigger_wake(now)
                 return
 
@@ -1930,7 +2160,7 @@ def voice_worker(loop):
         # - After wake, lower threshold so quiet mics can still start/finalize utterances.
         speech_threshold = SETTINGS.noise_gate_rms
         if wake_active or always_listening:
-            speech_threshold = max(0.0010, SETTINGS.noise_gate_rms * 0.20)
+            speech_threshold = max(SETTINGS.min_speech_rms, SETTINGS.noise_gate_rms * 0.20)
         speech = (rms_raw >= speech_threshold) or bool(partial)
 
         if partial and (now - last_partial_ts) > 0.35:
@@ -1986,41 +2216,121 @@ def voice_worker(loop):
                         logger.exception("Frame processing error (browser): %s", exc)
             return
 
-        channels = resolve_input_channels(SETTINGS, device)
-        if channels <= 0:
-            logger.error("Selected AUDIO_DEVICE has no input channels: %r", device)
-            return
+        reconnect_delay_sec = 0.75
+        open_fail_streak = 0
+        while not stop_event.is_set():
+            stream_opened = False
+            for device, input_sample_rate, channels, label in _stream_open_candidates():
+                if stop_event.is_set():
+                    break
+                if channels <= 0:
+                    continue
+                if _is_wdmks_device(device):
+                    # Blocking read mode is unstable/unsupported for many WDM-KS paths.
+                    logger.warning("Skipping WDM-KS input candidate (%s device=%r)", label, device)
+                    continue
+                try:
+                    with sd.RawInputStream(
+                        samplerate=input_sample_rate,
+                        blocksize=SETTINGS.block_size,
+                        dtype="int16",
+                        channels=channels,
+                        device=device,
+                    ) as stream:
+                        stream_opened = True
+                        open_fail_streak = 0
+                        reconnect_delay_sec = 0.75
+                        logger.info(
+                            "Voice capture started (%s device=%r sr=%s ch=%s)",
+                            label,
+                            device,
+                            input_sample_rate,
+                            channels,
+                        )
+                        # Clear previous transient audio-device errors once capture recovers.
+                        if "device invalidated" in str(app.state.session.get("debug", "")).lower() or "mic stream error" in str(app.state.session.get("debug", "")).lower():
+                            app.state.session["debug"] = ""
+                            _emit_state()
 
-        with sd.RawInputStream(
-            samplerate=input_sample_rate,
-            blocksize=SETTINGS.block_size,
-            dtype="int16",
-            channels=channels,
-            device=device,
-        ) as stream:
-            logger.info("Voice capture started (device)")
-            while not stop_event.is_set():
-                data, _ = stream.read(SETTINGS.block_size)
-                if channels and channels > 1:
-                    mono, best_ch, rms_by_ch = _select_loudest_channel_int16(data, channels)
-                    app.state.session["mic_channel"] = best_ch
-                    if rms_by_ch:
-                        app.state.session["mic_rms_channels"] = [round(float(r), 6) for r in rms_by_ch]
-                    try:
-                        handle_frame(mono)
-                    except Exception as exc:
-                        app.state.metrics["asr_errors"] += 1
-                        app.state.session["debug"] = f"Frame processing error: {exc}"
-                        _emit_state()
-                        logger.exception("Frame processing error (device mono): %s", exc)
-                else:
-                    try:
-                        handle_frame(data)
-                    except Exception as exc:
-                        app.state.metrics["asr_errors"] += 1
-                        app.state.session["debug"] = f"Frame processing error: {exc}"
-                        _emit_state()
-                        logger.exception("Frame processing error (device): %s", exc)
+                        while not stop_event.is_set():
+                            try:
+                                data, _ = stream.read(SETTINGS.block_size)
+                            except Exception as exc:
+                                if stop_event.is_set():
+                                    break
+                                app.state.metrics["asr_errors"] += 1
+                                if _is_device_invalidated_error(exc):
+                                    msg = f"Mic device invalidated; reopening stream: {exc}"
+                                    app.state.session["debug"] = msg
+                                    _emit_state()
+                                    logger.warning("%s", msg)
+                                    break
+                                # Any read error: break to reopen with next candidate.
+                                raise
+
+                            if channels and channels > 1:
+                                mono, best_ch, rms_by_ch = _select_loudest_channel_int16(
+                                    data,
+                                    channels,
+                                    SETTINGS.mic_channel_lock,
+                                )
+                                app.state.session["mic_channel"] = best_ch
+                                if rms_by_ch:
+                                    app.state.session["mic_rms_channels"] = [round(float(r), 6) for r in rms_by_ch]
+                                try:
+                                    handle_frame(mono)
+                                except Exception as exc:
+                                    app.state.metrics["asr_errors"] += 1
+                                    app.state.session["debug"] = f"Frame processing error: {exc}"
+                                    _emit_state()
+                                    logger.exception("Frame processing error (device mono): %s", exc)
+                            else:
+                                try:
+                                    handle_frame(data)
+                                except Exception as exc:
+                                    app.state.metrics["asr_errors"] += 1
+                                    app.state.session["debug"] = f"Frame processing error: {exc}"
+                                    _emit_state()
+                                    logger.exception("Frame processing error (device): %s", exc)
+
+                        # Stream ended gracefully or invalidated; retry candidate selection.
+                        break
+                except Exception as exc:
+                    if stop_event.is_set():
+                        break
+                    app.state.metrics["asr_errors"] += 1
+                    open_fail_streak += 1
+                    app.state.session["debug"] = f"Mic stream error; retrying: {exc}"
+                    _emit_state()
+                    if open_fail_streak <= 3 or (open_fail_streak % 5) == 0:
+                        logger.warning(
+                            "Mic stream open/read failed (%s); retrying: %s",
+                            label,
+                            exc,
+                        )
+                    if _is_insufficient_memory_error(exc):
+                        # PortAudio/WASAPI can get wedged after device hot-swap. Re-init backend.
+                        try:
+                            sd._terminate()
+                        except Exception:
+                            pass
+                        try:
+                            sd._initialize()
+                        except Exception:
+                            pass
+                        reconnect_delay_sec = min(4.0, reconnect_delay_sec * 1.35)
+                    if _is_blocking_api_unsupported_error(exc):
+                        # Fast-track to the next candidate/device backend.
+                        continue
+                if stream_opened:
+                    break
+
+            if not stream_opened:
+                # No candidate succeeded this cycle.
+                app.state.session["debug"] = "Mic unavailable; retrying with fallback devices/configs"
+                _emit_state()
+                logger.warning("Mic stream unavailable; all open candidates failed")
+            time.sleep(reconnect_delay_sec)
     except Exception as exc:
         app.state.voice_ok = False
         app.state.session["debug"] = f"Voice worker crashed: {exc}"
@@ -2068,15 +2378,7 @@ async def health():
 
 @app.get("/status")
 async def status():
-    return _json_sanitize({
-        "ok": True,
-        "voice_ok": app.state.voice_ok,
-        "session": dict(app.state.session),
-        "metrics": dict(app.state.metrics),
-        "command_queue_depth": command_queue.qsize(),
-        "voice_preset": dict(VOICE_PRESET),
-        "clients": len(clients),
-    })
+    return _status_payload()
 
 
 @app.get("/metrics")
@@ -2224,8 +2526,8 @@ async def reset_noise_profile():
 
 
 @app.get("/models")
-async def models_check():
-    """Check which model files and Python packages are present on this machine."""
+async def models_check(stream: bool = False, interval_ms: int = 2000):
+    """Check which model files/packages are present. Supports SSE with stream=true."""
     import shutil
     from pathlib import Path as _Path
 
@@ -2247,97 +2549,116 @@ async def models_check():
         except ImportError:
             return False
 
-    piper_exe_path = shutil.which(SETTINGS.piper_path) or SETTINGS.piper_path
-    piper_exe_exists = shutil.which(SETTINGS.piper_path) is not None or _Path(SETTINGS.piper_path).is_file()
-    oww_requested = (SETTINGS.wakeword_model_path or "").strip()
-    oww_path, oww_name = resolve_openwakeword_model_path(oww_requested)
-    selected_wake_model = (oww_path or oww_requested or "").strip().lower()
-    wake_model_label = (
-        f"Microsoft Keyword Model (.table){f' ({oww_name})' if oww_name else ''}"
-        if selected_wake_model.endswith(".table")
-        else f"OpenWakeWord Model (.tflite){f' ({oww_name})' if oww_name else ''}"
-    )
-    if not oww_path and oww_requested:
-        # Configured but couldn't resolve to an existing file.
-        # Surface the requested value so the UI doesn't misleadingly show "not configured".
-        oww_check = {"exists": False, "path": oww_requested, "reason": "file not found"}
-    else:
-        oww_check = _check_path(oww_path, is_dir=False)
-    deepgram_key_ok = bool((SETTINGS.deepgram_api_key or "").strip())
+    def _payload():
+        piper_exe_path = shutil.which(SETTINGS.piper_path) or SETTINGS.piper_path
+        piper_exe_exists = shutil.which(SETTINGS.piper_path) is not None or _Path(SETTINGS.piper_path).is_file()
+        oww_requested = (SETTINGS.wakeword_model_path or "").strip()
+        oww_path, oww_name = resolve_openwakeword_model_path(oww_requested)
+        selected_wake_model = (oww_path or oww_requested or "").strip().lower()
+        wake_model_label = (
+            f"Microsoft Keyword Model (.table){f' ({oww_name})' if oww_name else ''}"
+            if selected_wake_model.endswith(".table")
+            else f"OpenWakeWord Model (.tflite){f' ({oww_name})' if oww_name else ''}"
+        )
+        if not oww_path and oww_requested:
+            oww_check = {"exists": False, "path": oww_requested, "reason": "file not found"}
+        else:
+            oww_check = _check_path(oww_path, is_dir=False)
+        deepgram_key_ok = bool((SETTINGS.deepgram_api_key or "").strip())
 
-    return _json_sanitize({
-        "models": {
-            "deepgram_api": {
-                "exists": deepgram_key_ok,
-                "path": "DEEPGRAM_API_KEY",
-                "label": "Deepgram API Key",
-                "reason": "" if deepgram_key_ok else "DEEPGRAM_API_KEY missing",
+        return _json_sanitize({
+            "models": {
+                "deepgram_api": {
+                    "exists": deepgram_key_ok,
+                    "path": "DEEPGRAM_API_KEY",
+                    "label": "Deepgram API Key",
+                    "reason": "" if deepgram_key_ok else "DEEPGRAM_API_KEY missing",
+                },
+                "vosk_model": {
+                    **_check_path(SETTINGS.vosk_model_path, is_dir=True),
+                    "label": "Vosk Model Directory",
+                },
+                "piper_model": {
+                    **_check_path(SETTINGS.piper_model_path, is_dir=False),
+                    "label": "Piper TTS Voice (.onnx)",
+                },
+                "piper_exe": {
+                    "exists": piper_exe_exists,
+                    "path": piper_exe_path,
+                    "label": "Piper Executable",
+                    "reason": "" if piper_exe_exists else "not found in PATH or file missing",
+                },
+                "openwakeword_model": {
+                    **oww_check,
+                    "label": wake_model_label,
+                    "name": oww_name,
+                },
             },
-            "vosk_model": {
-                **_check_path(SETTINGS.vosk_model_path, is_dir=True),
-                "label": "Vosk Model Directory",
+            "packages": {
+                "websocket_client":      {"installed": _check_pkg("websocket"),           "label": "websocket-client"},
+                "vosk":                  {"installed": _check_pkg("vosk"),                "label": "vosk"},
+                "noisereduce":           {"installed": _check_pkg("noisereduce"),         "label": "noisereduce"},
+                "openwakeword":          {"installed": _check_pkg("openwakeword"),        "label": "openwakeword"},
+                "azure_speech_sdk":      {"installed": _check_pkg("azure.cognitiveservices.speech"), "label": "azure-cognitiveservices-speech"},
+                "sounddevice":           {"installed": _check_pkg("sounddevice"),         "label": "sounddevice"},
+                "python_dotenv":         {"installed": _check_pkg("dotenv"),              "label": "python-dotenv"},
+                "sentence_transformers": {"installed": _check_pkg("sentence_transformers"), "label": "sentence-transformers"},
             },
-            "piper_model": {
-                **_check_path(SETTINGS.piper_model_path, is_dir=False),
-                "label": "Piper TTS Voice (.onnx)",
+            "settings": {
+                "tts_enabled":       SETTINGS.tts_enabled,
+                "tts_backend":       SETTINGS.tts_backend,
+                "duck_enabled":      SETTINGS.duck_enabled,
+                "noise_reduction":   SETTINGS.noise_reduction_enabled,
+                "noise_gate_auto":   SETTINGS.noise_gate_auto,
+                "always_listening":  SETTINGS.always_listening,
+                "wake_word":         SETTINGS.wake_word,
+                "wake_phrase":       SETTINGS.wake_phrase,
+                "audio_source":      SETTINGS.audio_source,
+                "asr_backend":       SETTINGS.asr_backend,
+                "deepgram_model":    SETTINGS.deepgram_model,
+                "deepgram_language": SETTINGS.deepgram_language,
+                "vosk_model_path":   SETTINGS.vosk_model_path,
+                "intent_config_deepgram_path": SETTINGS.intent_config_deepgram_path,
+                "intent_config_vosk_path": SETTINGS.intent_config_vosk_path,
+                "transcript_debug_enabled": SETTINGS.transcript_debug_enabled,
+                "transcript_debug_max": SETTINGS.transcript_debug_max,
+                "use_embeddings":    os.getenv("USE_EMBEDDINGS", "false").lower() == "true",
+                "demo_grammar_lock": DEMO_GRAMMAR_LOCK,
+                "intent_confirm_threshold": INTENT_CONFIRM_THRESHOLD,
+                "command_rate_limit_sec": COMMAND_RATE_LIMIT_SEC,
+                "command_debounce_sec": COMMAND_DEBOUNCE_SEC,
+                "command_queue_max": COMMAND_QUEUE_MAX,
             },
-            "piper_exe": {
-                "exists": piper_exe_exists,
-                "path": piper_exe_path,
-                "label": "Piper Executable",
-                "reason": "" if piper_exe_exists else "not found in PATH or file missing",
+            "runtime": {
+                "noise_profile_ready": app.state.session.get("noise_profile_ready", False),
+                "noise_gate_rms":      round(SETTINGS.noise_gate_rms, 5),
+                "voice_ok":            app.state.voice_ok,
             },
-            "openwakeword_model": {
-                **oww_check,
-                "label": wake_model_label,
-                "name": oww_name,
-            },
+        })
+
+    if not stream:
+        return _payload()
+
+    interval_sec = max(0.5, min(10.0, float(interval_ms) / 1000.0))
+
+    async def _event_stream():
+        while True:
+            yield f"data: {json.dumps(_payload())}\n\n"
+            await asyncio.sleep(interval_sec)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
-        "packages": {
-            "websocket_client":      {"installed": _check_pkg("websocket"),           "label": "websocket-client"},
-            "vosk":                  {"installed": _check_pkg("vosk"),                "label": "vosk"},
-            "noisereduce":           {"installed": _check_pkg("noisereduce"),         "label": "noisereduce"},
-            "openwakeword":          {"installed": _check_pkg("openwakeword"),        "label": "openwakeword"},
-            "azure_speech_sdk":      {"installed": _check_pkg("azure.cognitiveservices.speech"), "label": "azure-cognitiveservices-speech"},
-            "sounddevice":           {"installed": _check_pkg("sounddevice"),         "label": "sounddevice"},
-            "python_dotenv":         {"installed": _check_pkg("dotenv"),              "label": "python-dotenv"},
-            "sentence_transformers": {"installed": _check_pkg("sentence_transformers"), "label": "sentence-transformers"},
-        },
-        "settings": {
-            "tts_enabled":       SETTINGS.tts_enabled,
-            "tts_backend":       SETTINGS.tts_backend,
-            "duck_enabled":      SETTINGS.duck_enabled,
-            "noise_reduction":   SETTINGS.noise_reduction_enabled,
-            "noise_gate_auto":   SETTINGS.noise_gate_auto,
-            "always_listening":  SETTINGS.always_listening,
-            "wake_word":         SETTINGS.wake_word,
-            "wake_phrase":       SETTINGS.wake_phrase,
-            "audio_source":      SETTINGS.audio_source,
-            "asr_backend":       SETTINGS.asr_backend,
-            "deepgram_model":    SETTINGS.deepgram_model,
-            "deepgram_language": SETTINGS.deepgram_language,
-            "vosk_model_path":   SETTINGS.vosk_model_path,
-            "intent_config_deepgram_path": SETTINGS.intent_config_deepgram_path,
-            "intent_config_vosk_path": SETTINGS.intent_config_vosk_path,
-            "transcript_debug_enabled": SETTINGS.transcript_debug_enabled,
-            "transcript_debug_max": SETTINGS.transcript_debug_max,
-            "use_embeddings":    os.getenv("USE_EMBEDDINGS", "false").lower() == "true",
-            "demo_grammar_lock": DEMO_GRAMMAR_LOCK,
-            "intent_confirm_threshold": INTENT_CONFIRM_THRESHOLD,
-            "command_rate_limit_sec": COMMAND_RATE_LIMIT_SEC,
-            "command_debounce_sec": COMMAND_DEBOUNCE_SEC,
-            "command_queue_max": COMMAND_QUEUE_MAX,
-        },
-        "runtime": {
-            "noise_profile_ready": app.state.session.get("noise_profile_ready", False),
-            "noise_gate_rms":      round(SETTINGS.noise_gate_rms, 5),
-            "voice_ok":            app.state.voice_ok,
-        },
-    })
+    )
 
 
 @app.get("/mic_test")
-async def mic_test():
+async def mic_test(stream: bool = False, interval_ms: int = 200):
     device_info = None
     selected_device = None
     try:
@@ -2350,15 +2671,43 @@ async def mic_test():
     except Exception:
         device_info = None
 
-    return {
-        "ok": True,
-        "voice_rms": app.state.session.get("voice_rms", 0.0),
-        "voice_rms_raw": app.state.session.get("voice_rms_raw", 0.0),
-        "voice_rms_norm": app.state.session.get("voice_rms_norm", None),
-        "audio_device_env": SETTINGS.device,
-        "selected_device": selected_device,
-        "default_input_device": device_info,
-    }
+    def _payload():
+        return _json_sanitize(
+            {
+                "ok": True,
+                "timestamp": round(time.time(), 3),
+                "audio_source": SETTINGS.audio_source,
+                "mode": app.state.mode,
+                "voice_rms": app.state.session.get("voice_rms", 0.0),
+                "voice_rms_raw": app.state.session.get("voice_rms_raw", 0.0),
+                "voice_rms_norm": app.state.session.get("voice_rms_norm", None),
+                "mic_channel": app.state.session.get("mic_channel", None),
+                "mic_rms_channels": app.state.session.get("mic_rms_channels", None),
+                "audio_device_env": SETTINGS.device,
+                "selected_device": selected_device,
+                "default_input_device": device_info,
+            }
+        )
+
+    if not stream:
+        return _payload()
+
+    interval_sec = max(0.05, min(2.0, float(interval_ms) / 1000.0))
+
+    async def _event_stream():
+        while True:
+            yield f"data: {json.dumps(_payload())}\n\n"
+            await asyncio.sleep(interval_sec)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/mic_test_stream")
@@ -2520,6 +2869,7 @@ async def on_shutdown():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     clients.add(websocket)
+    await websocket.send_text(json.dumps({"type": "status_snapshot", "status": _status_payload()}))
     try:
         while True:
             try:
@@ -2546,6 +2896,16 @@ async def audio_endpoint(websocket: WebSocket):
             try:
                 audio_queue.put_nowait(data)
             except queue.Full:
+                # Keep stream real-time: discard the oldest queued frame, keep latest audio.
+                try:
+                    _ = audio_queue.get_nowait()
+                    audio_queue.task_done()
+                except queue.Empty:
+                    pass
+                try:
+                    audio_queue.put_nowait(data)
+                except queue.Full:
+                    pass
                 drops = int(app.state.metrics.get("audio_queue_drops", 0)) + 1
                 app.state.metrics["audio_queue_drops"] = drops
                 if drops == 1 or drops % 50 == 0:

@@ -252,6 +252,8 @@ export default function App() {
   const [voiceMode, setVoiceMode] = useState('SLEEPING');
   const [voiceDebug, setVoiceDebug] = useState('');
   const [voiceLevel, setVoiceLevel] = useState(0);
+  const [analyserLevel, setAnalyserLevel] = useState(0);
+  const [spectrumData, setSpectrumData] = useState(Array(32).fill(0));
 
   // ── Mic State ─────────────────────────────────────────────────────────────
   const [micStreamStatus, setMicStreamStatus] = useState('idle');
@@ -260,6 +262,7 @@ export default function App() {
   // ── Backend Data ──────────────────────────────────────────────────────────
   const [statusData, setStatusData] = useState(null);
   const [modelsData, setModelsData] = useState(null);
+  const [eventLog, setEventLog] = useState([]);
 
   // ── Refs (stable across renders) ──────────────────────────────────────────
   const lastExperienceRef = useRef(null);
@@ -269,27 +272,45 @@ export default function App() {
   const voiceListRef = useRef([]);
   const alwaysListeningRef = useRef(false);
   const applyIntentRef = useRef(null);
+  const shouldUseBrowserTtsRef = useRef(false);
+  const speakRef = useRef(null);
   const activeModalRef = useRef(null);
   const activeOptionByModalRef = useRef({});
   const volumesRef = useRef({});
+  const lastDebugRef = useRef('');
 
   // ── Browser Mic Refs ──────────────────────────────────────────────────────
   const audioWsRef = useRef(null);
   const audioCtxRef = useRef(null);
   const audioProcessorRef = useRef(null);
   const audioStreamRef = useRef(null);
+  const analyserRef = useRef(null);
+  const analyserFrameRef = useRef(null);
 
   /* ─────────────────────────────────────────────────────────────────────────
      Derived Values
      ───────────────────────────────────────────────────────────────────────── */
 
   const wakeHint = useMemo(() => {
+    const configuredPhrase = modelsData?.settings?.wake_phrase || modelsData?.settings?.wake_word;
+    if (configuredPhrase) return configuredPhrase;
     const oww = modelsData?.models?.openwakeword_model;
     if (oww?.exists && oww?.name) {
       const hint = humanizeWakeModelName(oww.name);
       if (hint) return hint;
     }
-    return modelsData?.settings?.wake_phrase || modelsData?.settings?.wake_word || 'wake word';
+    return 'wake word';
+  }, [modelsData]);
+
+  const wakeModelStatus = useMemo(() => {
+    const model = modelsData?.models?.openwakeword_model;
+    if (!model?.exists) return 'ASR fallback';
+    const modelPath = String(model.path || '').toLowerCase();
+    const modelLabel = String(model.label || '').toLowerCase();
+    if (modelPath.endsWith('.table') || modelLabel.includes('microsoft keyword')) {
+      return 'Microsoft Keyword';
+    }
+    return 'OpenWakeWord';
   }, [modelsData]);
 
   const activeExperience = useMemo(
@@ -297,39 +318,77 @@ export default function App() {
     [activeModal],
   );
 
-  const backendAudioSource = modelsData?.settings?.audio_source || 'browser';
+  const backendAudioSource = modelsData?.settings?.audio_source || 'device';
+  const browserMicNeedsSecureContext =
+    backendAudioSource !== 'device' && !window.isSecureContext && !IS_LOCALHOST;
   const metrics = statusData?.metrics || {};
   const session = statusData?.session || {};
   const modeConfig = MODE_CONFIG[voiceMode] || MODE_CONFIG.SLEEPING;
+  const usingDeviceMic = backendAudioSource === 'device';
+  const micStatusLabel = usingDeviceMic ? 'Mic device' : `Mic ${micStreamStatus}`;
 
   const shouldUseBrowserTts = useMemo(() => {
     if (!window.speechSynthesis) return false;
     if (FORCE_BROWSER_TTS) return true;
-    if (!BACKEND_TTS) return BROWSER_TTS;
+    if (!BROWSER_TTS) return false;
+    if (!BACKEND_TTS) return true;
 
-    const backendTtsEnabled = modelsData?.settings?.tts_enabled;
-    const piperExeOk = modelsData?.models?.piper_exe?.exists;
-    const piperModelOk = modelsData?.models?.piper_model?.exists;
-    const backendTtsLooksOk =
-      backendTtsEnabled !== false && piperExeOk !== false && piperModelOk !== false;
+    // Backend TTS is the single source of truth unless /models explicitly says it is off.
+    return modelsData?.settings?.tts_enabled === false;
+  }, [modelsData]);
+  const ttsModeLabel = useMemo(() => {
+    if (shouldUseBrowserTts) return 'Browser TTS';
+    const configured = String(modelsData?.settings?.tts_backend || '').toLowerCase();
+    const lastBackend = String(session?.last_tts_backend || '').toLowerCase();
+    if (lastBackend === 'piper') return 'Piper fallback';
+    if (lastBackend === 'azure') return 'Azure Speech';
+    if (configured === 'azure' || configured === 'auto') return 'Azure Speech';
+    if (configured === 'piper') return 'Piper';
+    return 'Unknown';
+  }, [modelsData, session, shouldUseBrowserTts]);
 
-    const backendTtsErrors = Number(metrics.tts_errors || 0);
-    if (backendTtsErrors > 0) return true;
-    if (!backendTtsLooksOk) return true;
-
-    return false;
-  }, [modelsData, metrics.tts_errors]);
+  const pushEventLog = useCallback((label, detail = '') => {
+    const line = detail ? `${label} - ${detail}` : label;
+    const entry = { ts: Date.now(), line };
+    setEventLog((prev) => {
+      const next = [...prev, entry];
+      if (next.length > 120) return next.slice(next.length - 120);
+      return next;
+    });
+  }, []);
 
   const rms =
-    typeof session.voice_rms_norm === 'number'
-      ? session.voice_rms_norm
-      : typeof session.voice_rms_raw === 'number'
-        ? session.voice_rms_raw
-        : typeof session.voice_rms === 'number'
-          ? session.voice_rms
-          : null;
-  const rmsPct = rms !== null ? Math.min(100, Math.max(0, Math.round(rms * 200))) : null;
-  const displayLevel = rmsPct !== null ? rmsPct / 100 : voiceLevel;
+    usingDeviceMic
+      ? (typeof session.voice_rms_raw === 'number'
+          ? session.voice_rms_raw
+          : typeof session.voice_rms === 'number'
+            ? session.voice_rms
+            : null)
+      : (typeof session.voice_rms_norm === 'number'
+          ? session.voice_rms_norm
+          : typeof session.voice_rms_raw === 'number'
+            ? session.voice_rms_raw
+            : typeof session.voice_rms === 'number'
+              ? session.voice_rms
+              : null);
+  const rmsPct =
+    rms !== null
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            Math.round(
+              usingDeviceMic
+                ? Math.sqrt(Math.max(0, rms)) * 4000
+                : rms * 200,
+            ),
+          ),
+        )
+      : null;
+  const backendLevel = rmsPct !== null ? rmsPct / 100 : voiceLevel;
+  const displayLevel = Math.max(backendLevel, analyserLevel);
+  const micLevelPct = Math.min(100, Math.max(0, Math.round(displayLevel * 100)));
+  const micVizActive = voiceMode === 'LISTENING' || micLevelPct > 2;
 
   useEffect(() => {
     activeModalRef.current = activeModal;
@@ -342,6 +401,10 @@ export default function App() {
   useEffect(() => {
     volumesRef.current = volumes;
   }, [volumes]);
+
+  useEffect(() => {
+    shouldUseBrowserTtsRef.current = shouldUseBrowserTts;
+  }, [shouldUseBrowserTts]);
 
   /* ─────────────────────────────────────────────────────────────────────────
      TTS (Browser Speech Synthesis)
@@ -359,6 +422,10 @@ export default function App() {
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utter);
   }, [shouldUseBrowserTts]);
+
+  useEffect(() => {
+    speakRef.current = speak;
+  }, [speak]);
 
   /* ─────────────────────────────────────────────────────────────────────────
      Experience / Option Helpers
@@ -671,6 +738,11 @@ export default function App() {
      ───────────────────────────────────────────────────────────────────────── */
 
   const stopBrowserMic = useCallback((nextStatus = 'idle') => {
+    if (analyserFrameRef.current) {
+      cancelAnimationFrame(analyserFrameRef.current);
+      analyserFrameRef.current = null;
+    }
+    analyserRef.current = null;
     if (audioProcessorRef.current) {
       audioProcessorRef.current.disconnect();
       audioProcessorRef.current.onaudioprocess = null;
@@ -688,6 +760,8 @@ export default function App() {
       audioWsRef.current.close();
       audioWsRef.current = null;
     }
+    setAnalyserLevel(0);
+    setSpectrumData(Array(32).fill(0));
     setMicStreamStatus(nextStatus);
   }, []);
 
@@ -722,13 +796,23 @@ export default function App() {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: {
+          channelCount: { ideal: 1 },
+          sampleRate: { ideal: 16000 },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
       audioStreamRef.current = stream;
 
       const source = audioCtx.createMediaStreamSource(stream);
       const processor = audioCtx.createScriptProcessor(4096, 1, 1);
       const gain = audioCtx.createGain();
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.82;
+      analyserRef.current = analyser;
       gain.gain.value = 0; // Don't play mic audio back through speakers
 
       const connectAudioWs = () => {
@@ -756,15 +840,60 @@ export default function App() {
       };
 
       const ws = connectAudioWs();
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+      let lastAnalyserUiTs = 0;
+
+      const updateAnalyser = (ts) => {
+        if (!analyserRef.current || !audioStreamRef.current) return;
+        analyser.getByteFrequencyData(freqData);
+        if (!lastAnalyserUiTs || (ts - lastAnalyserUiTs) >= 50) {
+          const bars = 32;
+          const grouped = new Array(bars).fill(0);
+          const groupSize = Math.max(1, Math.floor(freqData.length / bars));
+          for (let i = 0; i < bars; i++) {
+            const start = i * groupSize;
+            const end = i === bars - 1 ? freqData.length : Math.min(freqData.length, start + groupSize);
+            let sum = 0;
+            let count = 0;
+            for (let j = start; j < end; j++) {
+              sum += freqData[j];
+              count += 1;
+            }
+            grouped[i] = count > 0 ? Math.min(1, (sum / count) / 255) : 0;
+          }
+          const energy = grouped.reduce((a, b) => a + b, 0) / Math.max(1, grouped.length);
+          setSpectrumData(grouped);
+          setAnalyserLevel((prev) => (prev * 0.55) + (energy * 0.45));
+          lastAnalyserUiTs = ts;
+        }
+        analyserFrameRef.current = requestAnimationFrame(updateAnalyser);
+      };
+      analyserFrameRef.current = requestAnimationFrame(updateAnalyser);
 
       processor.onaudioprocess = (event) => {
         const active = audioWsRef.current;
         if (!active || active.readyState !== 1) return;
-        const input = event.inputBuffer.getChannelData(0);
+        const inBuffer = event.inputBuffer;
+        let input = inBuffer.getChannelData(0);
+        if (inBuffer.numberOfChannels > 1) {
+          let bestChannel = 0;
+          let bestEnergy = -1;
+          for (let c = 0; c < inBuffer.numberOfChannels; c++) {
+            const ch = inBuffer.getChannelData(c);
+            let energy = 0;
+            for (let i = 0; i < ch.length; i++) energy += ch[i] * ch[i];
+            if (energy > bestEnergy) {
+              bestEnergy = energy;
+              bestChannel = c;
+            }
+          }
+          input = inBuffer.getChannelData(bestChannel);
+        }
         const downsampled = downsampleBuffer(input, audioCtx.sampleRate, 16000);
         active.send(floatTo16BitPCM(downsampled));
       };
 
+      source.connect(analyser);
       source.connect(processor);
       processor.connect(gain);
       gain.connect(audioCtx.destination);
@@ -777,16 +906,26 @@ export default function App() {
     }
   }, [modelsData, stopBrowserMic]);
 
+  // If backend switches to device mode, ensure browser mic resources are closed.
+  useEffect(() => {
+    if (!usingDeviceMic) return;
+    stopBrowserMic('device');
+    setMicStreamError('');
+  }, [usingDeviceMic, stopBrowserMic]);
+
   /* ─────────────────────────────────────────────────────────────────────────
      Intro / Start Experience
      ───────────────────────────────────────────────────────────────────────── */
 
   const startExperience = useCallback(() => {
+    if (backendAudioSource !== 'device' && micStreamStatus !== 'streaming') {
+      startBrowserMic();
+    }
     speak(
       `Welcome to our showroom. Say "${wakeHint}" to begin, then tell me what experience you'd like.`,
     );
     setIntroDone(true);
-  }, [speak, wakeHint]);
+  }, [backendAudioSource, micStreamStatus, speak, startBrowserMic, wakeHint]);
 
   /* ─────────────────────────────────────────────────────────────────────────
      Effects
@@ -818,30 +957,48 @@ export default function App() {
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
       try { ws = new WebSocket(VOICE_WS_URL); } catch (_) {
+        pushEventLog('ws', 'connect failed; retrying');
         reconnectTimer = setTimeout(connect, 2000);
         return;
       }
 
       setVoiceStatus('connecting');
-      ws.addEventListener('open', () => setVoiceStatus('connected'));
+      ws.addEventListener('open', () => {
+        setVoiceStatus('connected');
+        pushEventLog('ws', 'connected');
+      });
       ws.addEventListener('close', () => {
         setVoiceStatus('disconnected');
+        pushEventLog('ws', 'disconnected');
         if (alive) reconnectTimer = setTimeout(connect, 1500);
       });
-      ws.addEventListener('error', () => {}); // close fires next
+      ws.addEventListener('error', () => {
+        pushEventLog('ws', 'error');
+      }); // close fires next
 
       ws.addEventListener('message', (event) => {
         try {
           const payload = JSON.parse(event.data);
           if (!payload) return;
 
-          /* ── State update from backend ─────────────────────────────── */
+          if (payload.status && typeof payload.status === 'object') {
+            setStatusData(payload.status);
+          }
+          if (payload.type === 'status_snapshot' && payload.status) {
+            pushEventLog('snapshot', `mode=${payload.status?.session?.mode || '--'}`);
+            return;
+          }
+
           if (payload.type === 'state_update' && payload.state) {
             const st = payload.state;
             setVoiceMode(st.mode || 'SLEEPING');
             setVoiceTranscript(st.transcript_partial || st.last_final || '');
             setVoiceDebug(st.debug || '');
             alwaysListeningRef.current = Boolean(st.always_listening);
+            if (st.debug && st.debug !== lastDebugRef.current) {
+              lastDebugRef.current = st.debug;
+              pushEventLog('debug', st.debug);
+            }
 
             if (typeof st.voice_rms === 'number') {
               setVoiceLevel(Math.min(1, st.voice_rms * 2));
@@ -849,44 +1006,47 @@ export default function App() {
             }
             if (st.last_response) setActionLabel(st.last_response);
 
-            // First state_update: just sync the seq counter, don't act.
             if (!hasSeenVoiceStateRef.current) {
               hasSeenVoiceStateRef.current = true;
               lastIntentSeqRef.current = st.intent_seq || 0;
               return;
             }
 
-            // New intent detected
             if (st.intent_seq && st.intent_seq !== lastIntentSeqRef.current) {
               lastIntentSeqRef.current = st.intent_seq;
+              pushEventLog('intent', `${st.last_intent || 'unknown'} | ${st.last_final || ''}`);
 
-              // Apply intent to UI
               applyIntentRef.current?.(st.last_intent);
 
-              // ★ FIX: Speak ALL intents including greet
-              // The old code had `st.last_intent !== 'greet'` which blocked
-              // the greeting response from ever being spoken.
-              if (shouldUseBrowserTts && st.last_response) {
-                speak(st.last_response);
+              if (shouldUseBrowserTtsRef.current && st.last_response) {
+                speakRef.current?.(st.last_response);
               }
             }
             return;
           }
 
-          /* ── Voice events (wake, partial, final) ───────────────────── */
+          if (payload.type === 'command_event' && payload.payload) {
+            const ev = payload.payload;
+            pushEventLog(
+              `cmd:${ev.event || 'event'}`,
+              `${ev.intent || ''} ${ev.text || ''}`.trim(),
+            );
+            return;
+          }
+
           if (payload.source === 'voice') {
             if (payload.event === 'wake') {
+              pushEventLog('wake', 'detected');
               soundEffects.playWake();
               window.speechSynthesis?.cancel();
-
-              // ★ FIX: Speak greeting in ALL modes including always_listening
-              if (shouldUseBrowserTts) {
-                speak('How may I help you?');
-              }
+              setVoiceMode('LISTENING');
+              setVoiceLevel((prev) => Math.max(prev, 0.75));
+              lastVoiceAtRef.current = Date.now();
               return;
             }
 
             if (payload.text) {
+              if (payload.is_final) pushEventLog('final', payload.text);
               const spoken = normalize(payload.text);
               lastVoiceAtRef.current = Date.now();
               setVoiceLevel(1);
@@ -904,7 +1064,7 @@ export default function App() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       try { ws?.close(); } catch (_) {}
     };
-  }, []); // stable — uses refs for current callbacks
+  }, [pushEventLog]); // stable - uses refs for current callbacks
 
   // Decay voice level indicator
   useEffect(() => {
@@ -914,32 +1074,52 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Poll /status every 2s
+  // Bootstrap /status once (live values stream over websocket)
   useEffect(() => {
     let mounted = true;
-    const tick = async () => {
+    const bootstrap = async () => {
       try {
         const res = await fetch(VOICE_STATUS_URL, { cache: 'no-store' });
         if (res.ok && mounted) setStatusData(await res.json());
       } catch (_) {}
     };
-    tick();
-    const timer = setInterval(tick, 2000);
-    return () => { mounted = false; clearInterval(timer); };
+    bootstrap();
+    return () => { mounted = false; };
   }, []);
 
-  // Poll /models every 10s
+  // Live /models stream (SSE) with fetch fallback.
   useEffect(() => {
     let mounted = true;
+    let es = null;
+
     const tick = async () => {
       try {
         const res = await fetch(VOICE_MODELS_URL, { cache: 'no-store' });
         if (res.ok && mounted) setModelsData(await res.json());
       } catch (_) {}
     };
+
     tick();
-    const timer = setInterval(tick, 10000);
-    return () => { mounted = false; clearInterval(timer); };
+
+    try {
+      const url = `${VOICE_MODELS_URL}?stream=true&interval_ms=2000`;
+      es = new EventSource(url);
+      es.onmessage = (evt) => {
+        if (!mounted) return;
+        try {
+          const payload = JSON.parse(evt.data);
+          if (payload && typeof payload === 'object') setModelsData(payload);
+        } catch (_) {}
+      };
+      es.onerror = () => {
+        // Keep the last fetched/streamed snapshot; EventSource auto-reconnects.
+      };
+    } catch (_) {}
+
+    return () => {
+      mounted = false;
+      try { es?.close(); } catch (_) {}
+    };
   }, []);
 
   /* ─────────────────────────────────────────────────────────────────────────
@@ -1004,7 +1184,7 @@ export default function App() {
               />
               {modeConfig.label}
             </div>
-            <StatusBadge label={`Mic ${micStreamStatus}`} />
+            <StatusBadge label={micStatusLabel} />
             <StatusBadge label={`Voice ${voiceStatus}`} />
           </div>
         </header>
@@ -1080,13 +1260,14 @@ export default function App() {
                     {rmsPct !== null
                       ? `Mic ${rmsPct}%`
                       : voiceLevel > 0
-                        ? `Mic ${Math.round(voiceLevel * 100)}%`
+                        ? `Mic ${micLevelPct}%`
                         : 'Mic idle'}
                   </span>
                 </Row>
                 <VoiceWave
-                  isActive={voiceMode === 'LISTENING' || voiceLevel > 0.1}
+                  isActive={micVizActive}
                   amplitude={displayLevel}
+                  spectrumData={spectrumData}
                 />
                 {voiceDebug && (
                   <Row label="Debug">
@@ -1112,46 +1293,53 @@ export default function App() {
 
             {/* Voice Input Visualizer */}
             <SmallCard title="Voice Input">
+              {browserMicNeedsSecureContext && (
+                <div className="mt-3 rounded-xl border border-[#f0d3d3] bg-[#fff6f6] px-3 py-2 text-[11px] text-[#9b5a5a]">
+                  Browser mic is blocked on non-HTTPS LAN URLs. Use <code>https://</code>, <code>localhost</code>, or switch backend <code>AUDIO_SOURCE=device</code>.
+                </div>
+              )}
+
+              {usingDeviceMic && (
+                <div className="mt-3 rounded-xl border border-[#e3ddd2] bg-[#faf8f2] px-3 py-2 text-[11px] text-[#5b6068]">
+                  Using backend device microphone (<code>AUDIO_SOURCE=device</code>).
+                </div>
+              )}
+
               <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-[#efe8dd]">
                 <div
                   className="h-2 rounded-full bg-[#c6a86d] transition-[width] duration-150"
-                  style={{ width: `${rmsPct ?? Math.round(voiceLevel * 100)}%` }}
+                  style={{ width: `${micLevelPct}%` }}
                 />
               </div>
               <div className="mt-2 text-[11px] uppercase tracking-[0.18em] text-[#7b8088]">
-                {displayLevel > 0 ? 'Mic activity detected' : 'Waiting for voice'}
+                {micLevelPct > 1 ? 'Mic activity detected' : 'Waiting for voice'}
               </div>
 
               <div className="mt-4">
                 <AudioSpectrum
                   voiceLevel={displayLevel}
-                  isActive={voiceMode === 'LISTENING' || voiceLevel > 0.1}
+                  isActive={micVizActive}
+                  spectrumData={spectrumData}
                 />
               </div>
 
-              {/* Mic toggle button */}
-              <button
-                type="button"
-                disabled={backendAudioSource === 'device'}
-                className={`mt-5 w-full rounded-full border px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] transition-all active:scale-[0.97] ${
-                  backendAudioSource === 'device'
-                    ? 'cursor-not-allowed border-[#e3ddd2] bg-white/40 text-[#9aa0a8]'
-                    : micStreamStatus === 'streaming'
+              {!usingDeviceMic && (
+                <button
+                  type="button"
+                  className={`mt-5 w-full rounded-full border px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] transition-all active:scale-[0.97] ${
+                    micStreamStatus === 'streaming'
                       ? 'border-[#c6a86d] bg-[#c6a86d] text-white shadow-[0_4px_16px_rgba(198,168,109,0.3)]'
                       : 'border-[#e3ddd2] text-[#5b6068] hover:border-[#c6a86d]/50'
-                }`}
-                onClick={() =>
-                  micStreamStatus === 'streaming' ? stopBrowserMic() : startBrowserMic()
-                }
-              >
-                {backendAudioSource === 'device'
-                  ? 'Using Device Mic'
-                  : micStreamStatus === 'streaming'
-                    ? 'Stop Browser Mic'
-                    : 'Enable Browser Mic'}
-              </button>
+                  }`}
+                  onClick={() =>
+                    micStreamStatus === 'streaming' ? stopBrowserMic() : startBrowserMic()
+                  }
+                >
+                  {micStreamStatus === 'streaming' ? 'Stop Browser Mic' : 'Enable Browser Mic'}
+                </button>
+              )}
 
-              {micStreamError && (
+              {!usingDeviceMic && micStreamError && (
                 <div className="mt-3 text-xs text-[#9b5a5a]">{micStreamError}</div>
               )}
             </SmallCard>
@@ -1201,6 +1389,11 @@ export default function App() {
                       label={`TTS ${modelsData.settings.tts_enabled ? 'on' : 'off'}`}
                     />
                     <RuntimeItem
+                      on={!shouldUseBrowserTts}
+                      amber={String(session?.last_tts_backend || '').toLowerCase() === 'piper'}
+                      label={ttsModeLabel}
+                    />
+                    <RuntimeItem
                       on={modelsData.settings.duck_enabled}
                       label={`Duck ${modelsData.settings.duck_enabled ? 'on' : 'off'}`}
                     />
@@ -1237,11 +1430,7 @@ export default function App() {
                 <Metric label="Voice Engine" value={statusData?.voice_ok ? 'Online' : 'Offline'} />
                 <Metric
                   label="Wake Model"
-                  value={
-                    modelsData?.models?.openwakeword_model?.exists
-                      ? 'OpenWakeWord'
-                      : 'ASR fallback'
-                  }
+                  value={wakeModelStatus}
                 />
                 <Metric label="Clients" value={statusData?.clients ?? '--'} />
                 <Metric
@@ -1259,6 +1448,26 @@ export default function App() {
                 <Metric label="Last Wake" value={fmtTime(metrics.last_wake_ts)} />
                 <Metric label="Last Final" value={fmtTime(metrics.last_final_ts)} />
                 <Metric label="Last TTS" value={fmtTime(metrics.last_tts_ts)} />
+              </div>
+            </SmallCard>
+
+            <SmallCard title="Live Debug Log">
+              <div className="mt-2 text-[10px] uppercase tracking-[0.18em] text-[#7b8088]">
+                realtime websocket events
+              </div>
+              <div className="mt-2 max-h-44 space-y-1 overflow-y-auto rounded-xl border border-[#e8e1d5] bg-[#fcfbf8] p-2">
+                {eventLog.length === 0 ? (
+                  <div className="text-[11px] text-[#9b9fa6]">No events yet.</div>
+                ) : (
+                  [...eventLog].reverse().slice(0, 16).map((entry) => (
+                    <div key={`${entry.ts}-${entry.line}`} className="font-mono text-[10px] text-[#4b525b]">
+                      {new Date(entry.ts).toLocaleTimeString()} | {entry.line}
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="mt-2 text-[10px] text-[#7b8088]">
+                queue {statusData?.command_queue_depth ?? '--'} | ws {voiceStatus}
               </div>
             </SmallCard>
           </aside>

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 
-export default function VoiceWave({ isActive, amplitude = 0.5 }) {
+export default function VoiceWave({ isActive, amplitude = 0.5, spectrumData = [] }) {
   const canvasRef = useRef(null);
   const animationRef = useRef(null);
   const phaseRef = useRef(0);
@@ -42,7 +42,16 @@ export default function VoiceWave({ isActive, amplitude = 0.5 }) {
       }
 
       // Draw animated wave
-      phaseRef.current += 0.05;
+      const bins = Array.isArray(spectrumData) ? spectrumData : [];
+      const quarter = Math.max(1, Math.floor(bins.length / 4));
+      const low = bins.slice(0, quarter);
+      const high = bins.slice(Math.max(0, bins.length - quarter));
+      const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+      const bassEnergy = Math.max(0, Math.min(1, avg(low)));
+      const trebleEnergy = Math.max(0, Math.min(1, avg(high)));
+      const dynamicAmp = Math.max(0.06, Math.min(1.0, (amplitude * 0.65) + (bassEnergy * 0.9)));
+      const dynamicFreq = 3.5 + (trebleEnergy * 3.0);
+      phaseRef.current += 0.04 + (trebleEnergy * 0.08);
       
       const gradient = ctx.createLinearGradient(0, 0, width, 0);
       gradient.addColorStop(0, 'rgba(198, 168, 109, 0.3)');
@@ -58,8 +67,8 @@ export default function VoiceWave({ isActive, amplitude = 0.5 }) {
       ctx.beginPath();
       for (let x = 0; x < width; x += 2) {
         const normalizedX = x / width;
-        const waveAmplitude = amplitude * 30;
-        const y = centerY + Math.sin(normalizedX * Math.PI * 4 + phaseRef.current) * waveAmplitude;
+        const waveAmplitude = dynamicAmp * 30;
+        const y = centerY + Math.sin(normalizedX * Math.PI * dynamicFreq + phaseRef.current) * waveAmplitude;
         
         if (x === 0) {
           ctx.moveTo(x, y);
@@ -75,8 +84,8 @@ export default function VoiceWave({ isActive, amplitude = 0.5 }) {
       ctx.beginPath();
       for (let x = 0; x < width; x += 2) {
         const normalizedX = x / width;
-        const waveAmplitude = amplitude * 20;
-        const y = centerY + Math.sin(normalizedX * Math.PI * 4 + phaseRef.current + Math.PI / 2) * waveAmplitude;
+        const waveAmplitude = dynamicAmp * 20;
+        const y = centerY + Math.sin(normalizedX * Math.PI * dynamicFreq + phaseRef.current + Math.PI / 2) * waveAmplitude;
         
         if (x === 0) {
           ctx.moveTo(x, y);
@@ -97,7 +106,7 @@ export default function VoiceWave({ isActive, amplitude = 0.5 }) {
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [isActive, amplitude]);
+  }, [isActive, amplitude, spectrumData]);
 
   return (
     <div className="w-full h-12 rounded-lg border border-[#e3ddd2] bg-white/70 px-2 py-1">

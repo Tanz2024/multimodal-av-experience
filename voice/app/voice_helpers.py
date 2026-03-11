@@ -8,7 +8,7 @@ import time
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 
 DEFAULT_INTENT_CONFIG_PATH = str(Path(__file__).resolve().parents[1] / "config" / "intent_phrases.json")
 logger = logging.getLogger("voice-wake-sherpa")
@@ -82,8 +82,16 @@ class Settings:
     # Gate = residual_rms × multiplier.  3.0 means "3× the post-reduction noise floor".
     # Raise if you still get false triggers; lower if quiet voices get cut off.
     noise_gate_multiplier: float = float(os.getenv("NOISE_GATE_MULTIPLIER", "3.0"))
+    # Minimum speech RMS used while wake/listen is active (quiet mic safeguard).
+    min_speech_rms: float = float(os.getenv("MIN_SPEECH_RMS", "0.001"))
     # ASR backend identifier surfaced to frontend status panel.
     asr_backend: str = "deepgram"
+    # Keep ASR stream active in idle mode for wake-phrase fallback even when
+    # a local wake model is loaded.
+    force_asr_wake_phrase: bool = os.getenv("FORCE_ASR_WAKE_PHRASE", "false").lower() == "true"
+    # Optional fixed input channel for multi-channel devices (0-based).
+    # Set -1 to auto-pick loudest channel each frame.
+    mic_channel_lock: int = int(os.getenv("MIC_CHANNEL_LOCK", "-1"))
     # Extra silence window after TTS finishes before mic re-opens (avoids TTS echo)
     tts_cooldown_sec: float = float(os.getenv("TTS_COOLDOWN_SEC", "0.4"))
 
@@ -888,12 +896,14 @@ def resolve_device(settings: Settings):
                     candidates.append((idx, info))
 
             if candidates:
-                # On Windows, prefer WASAPI/WDM-KS devices over MME/DirectSound for stability.
+                # On Windows, prefer WASAPI first. WDM-KS can fail with blocking
+                # read API in PortAudio ("Blocking API not supported yet").
                 pref = {
                     "windows wasapi": 0,
-                    "windows wdm-ks": 1,
                     "windows directsound": 2,
                     "mme": 3,
+                    # Keep WDM-KS as last resort.
+                    "windows wdm-ks": 9,
                 }
                 try:
                     hostapis = sd.query_hostapis()
@@ -1033,7 +1043,7 @@ class OpenWakeWordDetector:
         except Exception:
             self.available = False
 
-    def score(self, audio) -> float:
+    def score(self, audio, src_sample_rate: int = 16000) -> float:
         if not self.available or self.model is None:
             return 0.0
         try:
@@ -1069,8 +1079,8 @@ class OpenWakeWordDetector:
         except Exception:
             return 0.0
 
-    def detect(self, audio) -> bool:
-        return self.score(audio) >= self.threshold
+    def detect(self, audio, src_sample_rate: int = 16000) -> bool:
+        return self.score(audio, src_sample_rate=src_sample_rate) >= self.threshold
 
 
 class MicrosoftKeywordDetector:
@@ -1093,6 +1103,8 @@ class MicrosoftKeywordDetector:
         self._keyword_model = None
         self._triggered = Event()
         self._lock = Lock()
+        self._stop_event = Event()
+        self._loop_thread = None
 
         resolved_path, resolved_name = resolve_openwakeword_model_path(model_path)
         if not resolved_path or not str(resolved_path).lower().endswith(".table"):
@@ -1128,7 +1140,6 @@ class MicrosoftKeywordDetector:
 
             recognizer.recognized.connect(_on_recognized)
             recognizer.canceled.connect(_on_canceled)
-            recognizer.start_keyword_recognition_async(keyword_model).get()
 
             self._speechsdk = speechsdk
             self._push_stream = push_stream
@@ -1136,31 +1147,70 @@ class MicrosoftKeywordDetector:
             self._keyword_model = keyword_model
             self.model_path = resolved_path
             self.model_name = resolved_name or os.path.splitext(os.path.basename(resolved_path))[0]
+
+            # Azure Speech SDK API varies by version:
+            # - Newer: start_keyword_recognition_async(model)
+            # - Older: recognize_once_async(model) only
+            if hasattr(recognizer, "start_keyword_recognition_async"):
+                recognizer.start_keyword_recognition_async(keyword_model).get()
+            elif hasattr(recognizer, "recognize_once_async"):
+                self._loop_thread = Thread(
+                    target=self._recognize_once_loop,
+                    name="ms-keyword-recognize-once",
+                    daemon=True,
+                )
+                self._loop_thread.start()
+            else:
+                raise RuntimeError(
+                    "KeywordRecognizer API unsupported: missing "
+                    "start_keyword_recognition_async/recognize_once_async"
+                )
+
             self.available = True
         except Exception as exc:
             self.last_error = str(exc)
             self.available = False
 
-    def _to_pcm16_bytes(self, audio) -> bytes:
+    def _recognize_once_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                result = self._recognizer.recognize_once_async(self._keyword_model).get()
+                reason = getattr(result, "reason", None)
+                rr = getattr(self._speechsdk, "ResultReason", None)
+                if rr is None or reason == rr.RecognizedKeyword:
+                    self._triggered.set()
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    break
+                self.last_error = str(exc)
+                time.sleep(0.05)
+
+    def _to_pcm16_bytes(self, audio, src_sample_rate: int = 44100) -> bytes:
         import numpy as np
 
         if isinstance(audio, (bytes, bytearray)):
-            return bytes(audio)
-        x = np.asarray(audio)
-        if x.dtype == np.int16:
-            return x.tobytes()
-        if np.issubdtype(x.dtype, np.floating):
-            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            x = np.clip(x, -1.0, 1.0)
-            return (x * 32767.0).astype(np.int16).tobytes()
-        x = np.clip(x, -32768, 32767).astype(np.int16)
-        return x.tobytes()
+            x = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            x = np.asarray(audio, dtype=np.float32)
+            if not np.issubdtype(np.asarray(audio).dtype, np.floating):
+                x = x / 32768.0
 
-    def score(self, audio) -> float:
+        if src_sample_rate != 16000 and len(x) > 1:
+            new_len = int(round(len(x) * 16000 / src_sample_rate))
+            if new_len > 1:
+                x_old = np.linspace(0.0, 1.0, num=len(x), endpoint=False)
+                x_new = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+                x = np.interp(x_new, x_old, x).astype(np.float32)
+
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        x = np.clip(x, -1.0, 1.0)
+        return (x * 32767.0).astype(np.int16).tobytes()
+
+    def score(self, audio, src_sample_rate: int = 16000) -> float:
         if not self.available:
             return 0.0
         try:
-            pcm = self._to_pcm16_bytes(audio)
+            pcm = self._to_pcm16_bytes(audio, src_sample_rate=src_sample_rate)
             if pcm:
                 with self._lock:
                     self._push_stream.write(pcm)
@@ -1172,18 +1222,29 @@ class MicrosoftKeywordDetector:
             self.last_error = str(exc)
             return 0.0
 
-    def detect(self, audio) -> bool:
-        return self.score(audio) >= self.threshold
+    def detect(self, audio, src_sample_rate: int = 16000) -> bool:
+        return self.score(audio, src_sample_rate=src_sample_rate) >= self.threshold
 
     def close(self):
-        try:
-            if self._recognizer is not None:
-                self._recognizer.stop_keyword_recognition_async().get()
-        except Exception:
-            pass
+        self._stop_event.set()
         try:
             if self._push_stream is not None:
                 self._push_stream.close()
+        except Exception:
+            pass
+        try:
+            if self._recognizer is not None:
+                # Continuous keyword API path.
+                if hasattr(self._recognizer, "stop_keyword_recognition_async"):
+                    self._recognizer.stop_keyword_recognition_async().get()
+                # One-shot recognize loop path.
+                elif self._loop_thread is None and hasattr(self._recognizer, "stop_recognition_async"):
+                    self._recognizer.stop_recognition_async().get()
+        except Exception:
+            pass
+        try:
+            if self._loop_thread is not None and self._loop_thread.is_alive():
+                self._loop_thread.join(timeout=0.5)
         except Exception:
             pass
 

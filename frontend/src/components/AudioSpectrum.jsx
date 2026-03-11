@@ -1,9 +1,16 @@
 import { useEffect, useState } from 'react';
 
-export default function AudioSpectrum({ voiceLevel = 0, isActive = false }) {
+export default function AudioSpectrum({ voiceLevel = 0, isActive = false, spectrumData = [] }) {
   const [bars, setBars] = useState(Array(32).fill(0));
 
   useEffect(() => {
+    if (Array.isArray(spectrumData) && spectrumData.length > 0) {
+      const nextBars = spectrumData.slice(0, 32).map((v) => Math.max(0, Math.min(100, v * 100)));
+      while (nextBars.length < 32) nextBars.push(0);
+      setBars(nextBars);
+      return;
+    }
+
     if (!isActive) {
       setBars(Array(32).fill(0));
       return;
@@ -20,7 +27,7 @@ export default function AudioSpectrum({ voiceLevel = 0, isActive = false }) {
     }, 50);
 
     return () => clearInterval(interval);
-  }, [isActive, voiceLevel]);
+  }, [isActive, voiceLevel, spectrumData]);
 
   return (
     <div className="w-full">
